@@ -19,7 +19,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType};
+//! use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType, scrape_servers};
 //! use futures::future::join_all;
 //!
 //! #[tokio::main]
@@ -44,23 +44,21 @@
 //!
 //!     let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
 //!
-//!     let futures = servers.into_iter().map(|server| {
-//!         let repolist = repolist.clone();
-//!         async move {
-//!             match server.scrape(repolist.clone()).await {
-//!                 Ok(populated_server) => {
-//!                     println!("{}", populated_server);
-//!                     populated_server.display();
-//!                     println!();
-//!                 }
-//!                 Err(e) => {
-//!                    panic!("Error: {:?}", e);
-//!                 }
-//!             }
-//!         }
-//!     });
+//!    // Scrape all servers in parallel
+//!    let results = scrape_servers(servers, repolist).await;
 //!
-//!     join_all(futures).await;
+//!    for result in results {
+//!        match result {
+//!            Ok(populated_server) => {
+//!                 println!("{}", populated_server);
+//!                 populated_server.display();
+//!                 println!();
+//!            }
+//!            Err(e) => {
+//!                panic!("Error: {:?}", e);
+//!            }
+//!       }
+//!     }
 //! }
 //! ```
 //!
@@ -69,7 +67,24 @@ mod errors;
 mod models;
 mod utilities;
 
+use crate::errors::AppError;
+use crate::models::PopulatedServer;
+
 pub use models::{Hostname, Server, ServerBackendType, ServerType};
+
+use futures::future::join_all;
+
+pub async fn scrape_servers(
+    servers: Vec<Server>,
+    repolist: Vec<&str>,
+) -> Vec<Result<PopulatedServer, AppError>> {
+    let futures = servers.into_iter().map(|server| {
+        let repolist = repolist.clone();
+        async move { server.scrape(repolist.clone()).await }
+    });
+
+    join_all(futures).await
+}
 
 #[cfg(test)]
 mod tests {
@@ -79,7 +94,7 @@ mod tests {
     use futures::future::join_all;
 
     #[tokio::test]
-    async fn test_online_cvmfs_servers() {
+    async fn test_online_cvmfs_servers_manually() {
         let servers = vec![
             Server::new(
                 ServerType::Stratum1,
@@ -117,6 +132,43 @@ mod tests {
         });
 
         join_all(futures).await;
+    }
+
+    #[tokio::test]
+    async fn test_online_cvmfs_servers_using_scan_servers() {
+        let servers = vec![
+            Server::new(
+                ServerType::Stratum1,
+                ServerBackendType::CVMFS,
+                Hostname("azure-us-east-s1.eessi.science".to_string()),
+            ),
+            Server::new(
+                ServerType::Stratum1,
+                ServerBackendType::CVMFS,
+                Hostname("aws-eu-central-s1.eessi.science".to_string()),
+            ),
+            Server::new(
+                ServerType::SyncServer,
+                ServerBackendType::S3,
+                Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
+            ),
+        ];
+
+        let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
+        let results = scrape_servers(servers, repolist.clone()).await;
+
+        for result in results {
+            match result {
+                Ok(popserver) => {
+                    for repo in repolist.clone() {
+                        assert!(popserver.has_repository(repo));
+                    }
+                }
+                Err(e) => {
+                    panic!("Error: {:?}", e);
+                }
+            }
+        }
     }
 
     #[tokio::test]

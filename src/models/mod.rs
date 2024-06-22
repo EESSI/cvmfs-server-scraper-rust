@@ -6,4 +6,4 @@ mod repositories_json;
 mod servers;
 
 pub use generic::{HexString, Hostname};
-pub use servers::{Server, ServerBackendType, ServerType};
+pub use servers::{PopulatedServer, Server, ServerBackendType, ServerType};

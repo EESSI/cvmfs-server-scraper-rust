@@ -13,8 +13,7 @@ And for each repository, it fetches:
 ## Usage
 
 ```rust
-use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType};
-use futures::future::join_all;
+use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType, scrape_servers};
 
 #[tokio::main]
 async fn main() {
@@ -38,22 +37,19 @@ async fn main() {
 
     let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
 
-    let futures = servers.into_iter().map(|server| {
-        let repolist = repolist.clone();
-        async move {
-            match server.scrape(repolist.clone()).await {
-                Ok(populated_server) => {
-                    println!("{}", populated_server);
-                    populated_server.display();
-                    println!();
-                }
-                Err(e) => {
-                    panic!("Error: {:?}", e);
-                }
+    let results = scrape_servers(servers, repolist).await;
+
+    for result in results {
+        match result {
+            Ok(populated_server) => {
+                println!("{}", populated_server);
+                populated_server.display();
+                println!();
+            }
+            Err(e) => {
+                eprintln!("Error: {:?}", e);
             }
         }
-    });
-
-    join_all(futures).await;
+    }
 }
 ```
