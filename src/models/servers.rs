@@ -1,10 +1,9 @@
-use chrono::{serde::ts_seconds, DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{AppError, ManifestError, ScrapeError};
 use crate::models::cvmfs_published::Manifest;
 use crate::models::cvmfs_status_json::StatusJSON;
-use crate::models::generic::Hostname;
+use crate::models::generic::{Hostname, MaybeRfc2822DateTime};
 use crate::models::meta_json::MetaJSON;
 use crate::models::repositories_json::RepositoriesJSON;
 
@@ -103,7 +102,7 @@ impl Server {
         let mut metadata = MetadataFromRepoJSON {
             schema_version: None,
             cvmfs_version: None,
-            last_geodb_update: None,
+            last_geodb_update: MaybeRfc2822DateTime(None),
             os_version_id: None,
             os_pretty_name: None,
             os_id: None,
@@ -243,7 +242,7 @@ impl Server {
             ServerMetadata {
                 schema_version: None,
                 cvmfs_version: None,
-                last_geodb_update: None,
+                last_geodb_update: MaybeRfc2822DateTime(None),
                 os_version_id: None,
                 os_pretty_name: None,
                 os_id: None,
@@ -311,7 +310,7 @@ impl PopulatedServer {
 pub struct MetadataFromRepoJSON {
     pub schema_version: Option<u32>,
     pub cvmfs_version: Option<semver::Version>,
-    pub last_geodb_update: Option<DateTime<Utc>>,
+    pub last_geodb_update: MaybeRfc2822DateTime,
     pub os_version_id: Option<String>,
     pub os_pretty_name: Option<String>,
     pub os_id: Option<String>,
@@ -333,7 +332,7 @@ impl TryFrom<RepositoriesJSON> for MetadataFromRepoJSON {
         Ok(MetadataFromRepoJSON {
             schema_version: Some(repo_json.schema),
             cvmfs_version,
-            last_geodb_update: Some(repo_json.last_geodb_update.clone()),
+            last_geodb_update: repo_json.last_geodb_update.clone(),
             os_version_id: repo_json.os_version_id.clone(),
             os_pretty_name: repo_json.os_pretty_name.clone(),
             os_id: repo_json.os_id.clone(),
@@ -349,7 +348,7 @@ impl TryFrom<RepositoriesJSON> for MetadataFromRepoJSON {
 pub struct ServerMetadata {
     pub schema_version: Option<u32>,
     pub cvmfs_version: Option<semver::Version>,
-    pub last_geodb_update: Option<DateTime<Utc>>,
+    pub last_geodb_update: MaybeRfc2822DateTime,
     pub os_version_id: Option<String>,
     pub os_pretty_name: Option<String>,
     pub os_id: Option<String>,
@@ -364,7 +363,7 @@ impl From<MetaJSON> for ServerMetadata {
         ServerMetadata {
             schema_version: None,
             cvmfs_version: None,
-            last_geodb_update: None,
+            last_geodb_update: MaybeRfc2822DateTime(None),
             os_version_id: None,
             os_pretty_name: None,
             os_id: None,
@@ -394,7 +393,7 @@ impl ServerMetadata {
         if let Some(cvmfs_version) = &self.cvmfs_version {
             println!("  CVMFS Version: {}", cvmfs_version);
         }
-        if let Some(last_geodb_update) = self.last_geodb_update {
+        if let MaybeRfc2822DateTime(Some(last_geodb_update)) = &self.last_geodb_update {
             println!("  Last GeoDB Update: {}", last_geodb_update);
         }
         if let Some(os_version_id) = &self.os_version_id {
@@ -473,10 +472,8 @@ impl RepositoryOrReplica {
 pub struct PopulatedRepositoryOrReplica {
     pub name: String,
     pub manifest: Manifest,
-    #[serde(with = "ts_seconds")]
-    pub last_snapshot: chrono::DateTime<chrono::Utc>,
-    #[serde(with = "ts_seconds")]
-    pub last_gc: chrono::DateTime<chrono::Utc>,
+    pub last_snapshot: MaybeRfc2822DateTime,
+    pub last_gc: MaybeRfc2822DateTime,
 }
 
 impl PopulatedRepositoryOrReplica {
