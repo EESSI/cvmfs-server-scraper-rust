@@ -60,8 +60,9 @@ pub enum ScrapeError {
     ConversionError(String),
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug)]
-pub enum AppError {
+pub enum CVMFSScraperError {
     #[error("Scrape error: {0}")]
     ScrapeError(#[from] ScrapeError),
 

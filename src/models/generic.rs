@@ -32,7 +32,7 @@ impl std::str::FromStr for Hostname {
             {
                 return Err(HostnameError::InvalidLabelFormat(format!(
                     "First and last character of '{}' is not alphanumeric.",
-                    label.to_string()
+                    label
                 )));
             }
             if label.contains("--") {
@@ -64,7 +64,7 @@ pub struct HexString(String);
 
 impl HexString {
     pub fn new(s: &str) -> Result<Self, ManifestError> {
-        if s.len() % 2 == 0 && s.chars().all(|c| c.is_digit(16)) {
+        if s.len() % 2 == 0 && s.chars().all(|c| c.is_ascii_hexdigit()) {
             Ok(HexString(s.to_string().to_lowercase()))
         } else {
             Err(ManifestError::InvalidHex(s.to_string()))

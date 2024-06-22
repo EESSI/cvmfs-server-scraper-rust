@@ -67,7 +67,7 @@ mod errors;
 mod models;
 mod utilities;
 
-use crate::errors::AppError;
+use crate::errors::CVMFSScraperError;
 use crate::models::PopulatedServer;
 
 pub use models::{Hostname, Server, ServerBackendType, ServerType};
@@ -77,7 +77,7 @@ use futures::future::join_all;
 pub async fn scrape_servers(
     servers: Vec<Server>,
     repolist: Vec<&str>,
-) -> Vec<Result<PopulatedServer, AppError>> {
+) -> Vec<Result<PopulatedServer, CVMFSScraperError>> {
     let futures = servers.into_iter().map(|server| {
         let repolist = repolist.clone();
         async move { server.scrape(repolist.clone()).await }

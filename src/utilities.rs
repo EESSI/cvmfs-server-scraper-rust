@@ -52,8 +52,8 @@ pub fn parse_timestamp_field(
             let timestamp = v
                 .parse::<i64>()
                 .map_err(|e| ManifestError::ParseError(key, e.to_string()))?;
-            Ok(DateTime::from_timestamp(timestamp, 0)
-                .ok_or_else(|| ManifestError::ParseError(key, "Invalid timestamp".to_string()))?)
+            DateTime::from_timestamp(timestamp, 0)
+                .ok_or_else(|| ManifestError::ParseError(key, "Invalid timestamp".to_string()))
         })
 }
 

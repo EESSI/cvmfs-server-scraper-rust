@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::errors::{AppError, ManifestError, ScrapeError};
+use crate::errors::{CVMFSScraperError, ManifestError, ScrapeError};
 use crate::models::cvmfs_published::Manifest;
 use crate::models::cvmfs_status_json::StatusJSON;
 use crate::models::generic::{Hostname, MaybeRfc2822DateTime};
@@ -91,7 +91,10 @@ impl Server {
         }
     }
 
-    pub async fn scrape(&self, repositories: Vec<&str>) -> Result<PopulatedServer, AppError> {
+    pub async fn scrape(
+        &self,
+        repositories: Vec<&str>,
+    ) -> Result<PopulatedServer, CVMFSScraperError> {
         let mut all_repos = repositories
             .iter()
             .map(|repo| repo.to_string())
@@ -132,14 +135,14 @@ impl Server {
                     ScrapeError::FetchError(_) => {
                         backend_detected = ServerBackendType::S3;
                     }
-                    _ => return Err(AppError::ScrapeError(error)),
+                    _ => return Err(CVMFSScraperError::ScrapeError(error)),
                 },
             },
             ServerBackendType::S3 => {
                 if all_repos.is_empty() {
-                    return Err(AppError::ScrapeError(ScrapeError::EmptyRepositoryList(
-                        self.hostname.0.clone(),
-                    )));
+                    return Err(CVMFSScraperError::ScrapeError(
+                        ScrapeError::EmptyRepositoryList(self.hostname.0.clone()),
+                    ));
                 }
             }
             ServerBackendType::CVMFS => {
@@ -169,7 +172,7 @@ impl Server {
         let metadata = self.merge_metadata(metadata, meta_json);
 
         Ok(PopulatedServer {
-            server_type: self.server_type.clone(),
+            server_type: self.server_type,
             backend_type: self.backend_type.clone(),
             backend_detected,
             hostname: self.hostname.clone(),
@@ -207,21 +210,21 @@ impl Server {
     fn validate_repo_json_and_server_type(
         &self,
         repo_json: &RepositoriesJSON,
-    ) -> Result<(), AppError> {
+    ) -> Result<(), CVMFSScraperError> {
         match (self.server_type, repo_json.replicas.is_empty()) {
-            (ServerType::Stratum0, false) => Err(AppError::ScrapeError(
+            (ServerType::Stratum0, false) => Err(CVMFSScraperError::ScrapeError(
                 ScrapeError::ServerTypeMismatch(format!(
                     "{} is a Stratum0 server, but replicas were found in the repositories.json",
                     self.hostname.0
                 )),
             )),
-            (ServerType::Stratum1, true) => Err(AppError::ScrapeError(
+            (ServerType::Stratum1, true) => Err(CVMFSScraperError::ScrapeError(
                 ScrapeError::ServerTypeMismatch(format!(
                     "{} is a Stratum1 server, but no replicas were found in the repositories.json",
                     self.hostname.0
                 )),
             )),
-            (ServerType::SyncServer, true) => Err(AppError::ScrapeError(
+            (ServerType::SyncServer, true) => Err(CVMFSScraperError::ScrapeError(
                 ScrapeError::ServerTypeMismatch(format!(
                     "{} is a SyncServer, but no replicas were found in the repositories.json",
                     self.hostname.0
@@ -289,9 +292,7 @@ impl PopulatedServer {
     }
 
     pub fn has_repository(&self, repository: &str) -> bool {
-        self.repositories
-            .iter()
-            .any(|r| r.name == repository.to_string())
+        self.repositories.iter().any(|r| r.name == *repository)
     }
 }
 
@@ -433,7 +434,7 @@ impl RepositoryOrReplica {
         }
     }
 
-    pub async fn scrape(&self) -> Result<PopulatedRepositoryOrReplica, AppError> {
+    pub async fn scrape(&self) -> Result<PopulatedRepositoryOrReplica, CVMFSScraperError> {
         let repo_status = self.fetch_repository_status_json().await?;
         Ok(PopulatedRepositoryOrReplica {
             name: self.name.clone(),
