@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::num::ParseIntError;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
-use serde::{Deserialize, Deserializer};
+use chrono::{DateTime, Utc};
 
 use crate::errors::ManifestError;
 use crate::models::HexString;
@@ -56,27 +55,6 @@ pub fn parse_timestamp_field(
             Ok(DateTime::from_timestamp(timestamp, 0)
                 .ok_or_else(|| ManifestError::ParseError(key, "Invalid timestamp".to_string()))?)
         })
-}
-
-pub fn deserialize_date<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s: &str = Deserialize::deserialize(deserializer)?;
-    // Try parsing the date string with the format
-    let naive_dt = NaiveDateTime::parse_from_str(s, "%a %b %d %H:%M:%S %Z %Y")
-        .map_err(serde::de::Error::custom)?;
-    // Convert NaiveDateTime to DateTime<Utc>
-    Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, Utc))
-}
-
-pub fn serialize_date<S>(date: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    // Format the date string with the format
-    let s = date.format("%a %b %d %H:%M:%S %Z %Y").to_string();
-    serializer.serialize_str(&s)
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{HostnameError, ManifestError, ScrapeError};
@@ -93,6 +93,43 @@ impl<'de> Deserialize<'de> for HexString {
     {
         let s: &str = Deserialize::deserialize(deserializer)?;
         HexString::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct MaybeRfc2822DateTime(pub Option<String>);
+
+impl std::fmt::Display for MaybeRfc2822DateTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(date_str) => write!(f, "{}", date_str),
+            None => write!(f, ""),
+        }
+    }
+}
+
+impl MaybeRfc2822DateTime {
+    pub fn try_into_datetime(&self) -> Result<Option<DateTime<Utc>>, ScrapeError> {
+        match &self.0 {
+            Some(date_str) => {
+                // Try parsing the date string with the format
+                let naive_dt = NaiveDateTime::parse_from_str(date_str, "%a %b %d %H:%M:%S %Z %Y")
+                    .map_err(|_| ScrapeError::ConversionError(date_str.clone()))?;
+                // Convert NaiveDateTime to DateTime<Utc>
+                Ok(Some(DateTime::<Utc>::from_naive_utc_and_offset(
+                    naive_dt, Utc,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.0.is_none()
     }
 }
 

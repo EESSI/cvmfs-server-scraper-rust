@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use chrono::{DateTime, Utc};
-
-use crate::utilities::{deserialize_date, serialize_date};
+use super::generic::MaybeRfc2822DateTime;
 
 // The format of the repositories.json also includes the metadata for the server:
 // {
@@ -33,11 +31,7 @@ use crate::utilities::{deserialize_date, serialize_date};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RepositoriesJSON {
     pub schema: u32,
-    #[serde(
-        deserialize_with = "deserialize_date",
-        serialize_with = "serialize_date"
-    )]
-    pub last_geodb_update: DateTime<Utc>,
+    pub last_geodb_update: MaybeRfc2822DateTime,
     pub cvmfs_version: Option<String>,
     pub os_id: Option<String>,
     pub os_version_id: Option<String>,
@@ -100,10 +94,12 @@ mod tests {
         let metadata: RepositoriesJSON = serde_json::from_str(json_data).unwrap();
         assert_eq!(metadata.schema, 1);
         assert_eq!(
-            metadata.last_geodb_update,
-            Rfc2822DateTime::from("Tue, 18 Jun 2024 13:40:04 +0000")
-                .try_into()
-                .unwrap()
+            metadata.last_geodb_update.try_into_datetime().unwrap(),
+            Some(
+                Rfc2822DateTime::from("Tue, 18 Jun 2024 13:40:04 +0000")
+                    .try_into()
+                    .unwrap()
+            )
         );
         assert_eq!(metadata.cvmfs_version, Some("2.11.3-1".to_string()));
         assert_eq!(metadata.os_id, Some("rhel".to_string()));
@@ -230,7 +226,7 @@ mod tests {
         }
         "#;
 
-        let metadata: Result<RepositoriesJSON, _> = serde_json::from_str(json_data);
-        assert!(metadata.is_err());
+        let metadata: RepositoriesJSON = serde_json::from_str(json_data).unwrap();
+        assert!(metadata.last_geodb_update.try_into_datetime().is_err());
     }
 }
