@@ -63,9 +63,13 @@
 //! ```
 //!
 
-mod errors;
+use log::{info, trace, warn};
+use std::time::Instant;
+
 mod models;
 mod utilities;
+
+pub mod errors;
 
 use crate::errors::CVMFSScraperError;
 use crate::models::PopulatedServer;
@@ -78,12 +82,55 @@ pub async fn scrape_servers(
     servers: Vec<Server>,
     repolist: Vec<&str>,
 ) -> Vec<Result<PopulatedServer, CVMFSScraperError>> {
-    let futures = servers.into_iter().map(|server| {
+    let start = Instant::now();
+    let scrapes_attempted = servers.len();
+    trace!(
+        "Start of scraping run. Servers: {:?}, repositories: {:?}",
+        servers,
+        repolist
+    );
+    let futures = servers.iter().map(|server| {
         let repolist = repolist.clone();
         async move { server.scrape(repolist.clone()).await }
     });
 
-    join_all(futures).await
+    let result = join_all(futures).await;
+    let scrapes_succeeded = result.iter().filter(|r| r.is_ok()).count();
+
+    for server in servers.iter() {
+        let server_result = result.iter().find(|r| match r {
+            Ok(popserver) => popserver.hostname == server.hostname,
+            Err(_) => false,
+        });
+
+        if server_result.is_none() {
+            let error = result.iter().find_map(|r| match r {
+                Err(e) => Some(e.to_string()),
+                _ => None,
+            });
+
+            if let Some(error) = error {
+                warn!(
+                    "Scraping failed for server: {} with error: {}",
+                    server.hostname, error
+                );
+            } else {
+                warn!(
+                    "Scraping failed for server: {} with unknown error",
+                    server.hostname
+                );
+            }
+        }
+    }
+
+    info!(
+        "Scraped {} servers ({} succeeded), run duration: {:?}",
+        scrapes_attempted,
+        scrapes_succeeded,
+        start.elapsed()
+    );
+    trace!("Scraping servers completed with results: {:?}", result);
+    result
 }
 
 #[cfg(test)]

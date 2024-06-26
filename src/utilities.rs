@@ -1,9 +1,13 @@
+use log::trace;
+use reqwest::Client;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::num::ParseIntError;
 
 use chrono::{DateTime, Utc};
 
-use crate::errors::ManifestError;
+use crate::errors::{ManifestError, ScrapeError};
 use crate::models::HexString;
 
 /// Parse a boolean field from a manifest.
@@ -57,6 +61,23 @@ pub fn parse_timestamp_field(
         })
 }
 
+pub async fn fetch_json<T, U>(client: &Client, url: T) -> Result<U, ScrapeError>
+where
+    T: Display,
+    U: DeserializeOwned,
+{
+    trace!("Fetching JSON from {}", url);
+    let response = client
+        .get(url.to_string())
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+
+    let json: U = serde_json::from_str(&response)?;
+    Ok(json)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -50,6 +50,16 @@ impl std::fmt::Display for Hostname {
     }
 }
 
+impl Hostname {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn as_string(&self) -> String {
+        self.0.clone()
+    }
+}
+
 /// A hexadecimal string.
 ///
 /// This type is used to represent a hexadecimal string. It is a wrapper around a `String` and
@@ -233,5 +243,17 @@ mod tests {
             Err(_) => {}
             _ => panic!("Unexpected success from {:?}", date),
         }
+    }
+
+    #[test]
+    fn test_hostname_as_str() {
+        let hostname = Hostname("example.com".to_string());
+        assert_eq!(hostname.as_str(), "example.com");
+    }
+
+    #[test]
+    fn test_hostname_as_string() {
+        let hostname = Hostname("example.com".to_string());
+        assert_eq!(hostname.as_string(), "example.com");
     }
 }

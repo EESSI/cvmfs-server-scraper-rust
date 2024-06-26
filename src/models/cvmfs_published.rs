@@ -24,7 +24,7 @@ use crate::utilities::{parse_boolean_field, parse_hex_field, parse_number_field}
 /// - L: currently unused (reserved for micro catalogs)
 /// signature - In order to provide authoritative information about a repository publisher, the repository manifest is signed by an X.509 certificate together with its private key.
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Clone, PartialEq)]
 pub struct Manifest {
     pub c: HexString,
     pub b: i64,
@@ -41,6 +41,31 @@ pub struct Manifest {
     pub y: HexString,
     pub l: String, // Currently unused
     pub signature: String,
+}
+
+/// Debug implementation for Manifest
+///
+/// This implementation allows the struct to be printed with debug formatting,
+/// but only the fields are printed, not the signature (which is a binart blob).
+impl std::fmt::Debug for Manifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Manifest")
+            .field("c", &self.c)
+            .field("b", &self.b)
+            .field("a", &self.a)
+            .field("r", &self.r)
+            .field("x", &self.x)
+            .field("g", &self.g)
+            .field("h", &self.h)
+            .field("t", &self.t)
+            .field("d", &self.d)
+            .field("s", &self.s)
+            .field("n", &self.n)
+            .field("m", &self.m)
+            .field("y", &self.y)
+            .field("l", &self.l)
+            .finish()
+    }
 }
 
 impl Manifest {

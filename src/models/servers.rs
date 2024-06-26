@@ -1,3 +1,4 @@
+use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::{CVMFSScraperError, ManifestError, ScrapeError};
@@ -6,6 +7,7 @@ use crate::models::cvmfs_status_json::StatusJSON;
 use crate::models::generic::{Hostname, MaybeRfc2822DateTime};
 use crate::models::meta_json::MetaJSON;
 use crate::models::repositories_json::RepositoriesJSON;
+use crate::utilities::fetch_json;
 
 /// The type of server we're dealing with.
 ///
@@ -46,8 +48,13 @@ pub enum ServerBackendType {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Server {
     pub server_type: ServerType,
+    #[serde(default = "default_backend_type")]
     pub backend_type: ServerBackendType,
     pub hostname: Hostname,
+}
+
+fn default_backend_type() -> ServerBackendType {
+    ServerBackendType::AutoDetect
 }
 
 /// A populated server object.
@@ -84,6 +91,7 @@ impl Server {
         backend_type: ServerBackendType,
         hostname: Hostname,
     ) -> Self {
+        trace!("Creating server object for {}", hostname.0);
         Server {
             server_type,
             backend_type,
@@ -95,6 +103,8 @@ impl Server {
         &self,
         repositories: Vec<&str>,
     ) -> Result<PopulatedServer, CVMFSScraperError> {
+        debug!("Scraping server {}", self.hostname.0);
+        let client = reqwest::Client::new();
         let mut all_repos = repositories
             .iter()
             .map(|repo| repo.to_string())
@@ -119,8 +129,9 @@ impl Server {
         //        if the fetch fails.
 
         match self.backend_type {
-            ServerBackendType::AutoDetect => match self.fetch_repos_json().await {
+            ServerBackendType::AutoDetect => match self.fetch_repos_json(&client).await {
                 Ok(repo_json) => {
+                    debug!("Detected CVMFS backend for {}", self.hostname.0);
                     self.validate_repo_json_and_server_type(&repo_json)?;
                     metadata = MetadataFromRepoJSON::try_from(repo_json.clone())?;
                     backend_detected = ServerBackendType::CVMFS;
@@ -133,6 +144,7 @@ impl Server {
                 }
                 Err(error) => match error {
                     ScrapeError::FetchError(_) => {
+                        debug!("Detected S3 backend for {}", self.hostname.0);
                         backend_detected = ServerBackendType::S3;
                     }
                     _ => return Err(CVMFSScraperError::ScrapeError(error)),
@@ -140,13 +152,17 @@ impl Server {
             },
             ServerBackendType::S3 => {
                 if all_repos.is_empty() {
+                    error!(
+                        "Empty repository list with explicit S3 backend: {}",
+                        self.hostname.0
+                    );
                     return Err(CVMFSScraperError::ScrapeError(
                         ScrapeError::EmptyRepositoryList(self.hostname.0.clone()),
                     ));
                 }
             }
             ServerBackendType::CVMFS => {
-                let repo_json = self.fetch_repos_json().await?;
+                let repo_json = self.fetch_repos_json(&client).await?;
                 metadata = MetadataFromRepoJSON::try_from(repo_json.clone())?;
                 self.validate_repo_json_and_server_type(&repo_json)?;
                 all_repos.extend(
@@ -160,11 +176,11 @@ impl Server {
 
         for repo in all_repos {
             let repo = RepositoryOrReplica::new(&repo, self);
-            let populated_repo = repo.scrape().await?;
+            let populated_repo = repo.scrape(&client).await?;
             populated_repos.push(populated_repo);
         }
 
-        let meta_json: Option<MetaJSON> = match self.fetch_meta_json().await {
+        let meta_json: Option<MetaJSON> = match self.fetch_meta_json(&client).await {
             Ok(meta) => Some(meta),
             Err(_) => None,
         };
@@ -181,36 +197,30 @@ impl Server {
         })
     }
 
-    async fn fetch_repos_json(&self) -> Result<RepositoriesJSON, ScrapeError> {
-        Ok(serde_json::from_str(
-            &reqwest::get(format!(
-                "http://{}/cvmfs/info/v1/repositories.json",
-                self.hostname.0
-            ))
-            .await?
-            .error_for_status()?
-            .text()
-            .await?,
-        )?)
+    async fn fetch_repos_json(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<RepositoriesJSON, ScrapeError> {
+        fetch_json(
+            client,
+            format!("http://{}/cvmfs/info/v1/repositories.json", self.hostname.0),
+        )
+        .await
     }
 
-    async fn fetch_meta_json(&self) -> Result<MetaJSON, ScrapeError> {
-        Ok(serde_json::from_str(
-            &reqwest::get(format!(
-                "http://{}/cvmfs/info/v1/meta.json",
-                self.hostname.0
-            ))
-            .await?
-            .error_for_status()?
-            .text()
-            .await?,
-        )?)
+    async fn fetch_meta_json(&self, client: &reqwest::Client) -> Result<MetaJSON, ScrapeError> {
+        fetch_json(
+            client,
+            format!("http://{}/cvmfs/info/v1/meta.json", self.hostname.0),
+        )
+        .await
     }
 
     fn validate_repo_json_and_server_type(
         &self,
         repo_json: &RepositoriesJSON,
     ) -> Result<(), CVMFSScraperError> {
+        trace!("Validating {}", self.hostname.0);
         match (self.server_type, repo_json.replicas.is_empty()) {
             (ServerType::Stratum0, false) => Err(CVMFSScraperError::ScrapeError(
                 ScrapeError::ServerTypeMismatch(format!(
@@ -434,38 +444,46 @@ impl RepositoryOrReplica {
         }
     }
 
-    pub async fn scrape(&self) -> Result<PopulatedRepositoryOrReplica, CVMFSScraperError> {
-        let repo_status = self.fetch_repository_status_json().await?;
+    pub async fn scrape(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<PopulatedRepositoryOrReplica, CVMFSScraperError> {
+        let repo_status = self.fetch_repository_status_json(client).await?;
         Ok(PopulatedRepositoryOrReplica {
             name: self.name.clone(),
-            manifest: self.fetch_repository_manifest().await?,
+            manifest: self.fetch_repository_manifest(client).await?,
             last_snapshot: repo_status.last_snapshot,
             last_gc: repo_status.last_gc,
         })
     }
 
-    async fn fetch_repository_manifest(&self) -> Result<Manifest, ManifestError> {
+    async fn fetch_repository_manifest(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<Manifest, ManifestError> {
         let url = format!(
             "http://{}/cvmfs/{}/.cvmfspublished",
             self.server.hostname.0, self.name
         );
-        let response = reqwest::get(url).await?;
+        let response = client.get(url).send().await?;
         let content = response.error_for_status()?.text().await?;
+        let content = content.as_str();
         // println!("{}", content);
         Manifest::from_str(&content)
     }
 
-    async fn fetch_repository_status_json(&self) -> Result<StatusJSON, ScrapeError> {
-        Ok(serde_json::from_str(
-            &reqwest::get(format!(
+    async fn fetch_repository_status_json(
+        &self,
+        client: &reqwest::Client,
+    ) -> Result<StatusJSON, ScrapeError> {
+        fetch_json(
+            client,
+            format!(
                 "http://{}/cvmfs/{}/.cvmfs_status.json",
                 self.server.hostname.0, self.name
-            ))
-            .await?
-            .error_for_status()?
-            .text()
-            .await?,
-        )?)
+            ),
+        )
+        .await
     }
 }
 
