@@ -1,9 +1,10 @@
+use std::sync::Arc;
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ManifestError {
     #[error("Failed to fetch manifest: {0}")]
-    FetchError(#[from] reqwest::Error),
+    FetchError(Arc<reqwest::Error>),
 
     #[error("Missing field {0}")]
     MissingField(char),
@@ -18,7 +19,7 @@ pub enum ManifestError {
     InvalidCertificate(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum HostnameError {
     #[error("Invalid hostname length: {0} > 255")]
     TooLong(String),
@@ -36,13 +37,13 @@ pub enum HostnameError {
     ConsecutiveDashes(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ScrapeError {
     #[error("Failed to scrape: {0}")]
-    FetchError(#[from] reqwest::Error),
+    FetchError(Arc<reqwest::Error>),
 
     #[error("Failed to parse scrape result: {0}")]
-    ParseError(#[from] serde_json::Error),
+    ParseError(Arc<serde_json::Error>),
 
     #[error("Failed to parse scrape result: {0}")]
     InvalidJson(String),
@@ -60,8 +61,14 @@ pub enum ScrapeError {
     ConversionError(String),
 }
 
+#[derive(Error, Debug, Clone)]
+pub enum GenericError {
+    #[error("Type error: {0}")]
+    TypeError(String),
+}
+
 #[allow(clippy::enum_variant_names)]
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum CVMFSScraperError {
     #[error("Scrape error: {0}")]
     ScrapeError(#[from] ScrapeError),
@@ -71,4 +78,25 @@ pub enum CVMFSScraperError {
 
     #[error("Hostname error: {0}")]
     HostnameError(#[from] HostnameError),
+
+    #[error("Generic error: {0}")]
+    GenericError(#[from] GenericError),
+}
+
+impl From<reqwest::Error> for ManifestError {
+    fn from(error: reqwest::Error) -> Self {
+        ManifestError::FetchError(Arc::new(error))
+    }
+}
+
+impl From<reqwest::Error> for ScrapeError {
+    fn from(error: reqwest::Error) -> Self {
+        ScrapeError::FetchError(Arc::new(error))
+    }
+}
+
+impl From<serde_json::Error> for ScrapeError {
+    fn from(error: serde_json::Error) -> Self {
+        ScrapeError::ParseError(Arc::new(error))
+    }
 }

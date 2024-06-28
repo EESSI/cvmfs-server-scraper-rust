@@ -14,12 +14,12 @@
 //! - cvmfs/\<repo\>/.cvmfs_status.json : Information about the last garbage collection and snapshot.
 //! - cvmfs/\<repo\>/.cvmfspublished : Manifest of the repository.
 //!
-//! Due to the nature of repositories.json, one may force repositories to be scraped by providing an explicit list of repositories to scrape.
+//! Due to the nature of repositories.json, one may force repositories to be scraped by providing an explicit list of repositories by name.
 //!
 //! # Examples
 //!
 //! ```no_run
-//! use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType, scrape_servers};
+//! use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType, scrape_servers, ScrapedServer};
 //! use futures::future::join_all;
 //!
 //! #[tokio::main]
@@ -32,7 +32,7 @@
 //!         ),
 //!         Server::new(
 //!             ServerType::Stratum1,
-//!             ServerBackendType::CVMFS,
+//!             ServerBackendType::AutoDetect,
 //!             Hostname("aws-eu-central-s1.eessi.science".to_string()),
 //!         ),
 //!         Server::new(
@@ -45,17 +45,17 @@
 //!     let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
 //!
 //!    // Scrape all servers in parallel
-//!    let results = scrape_servers(servers, repolist).await;
+//!    let servers = scrape_servers(servers, repolist).await;
 //!
-//!    for result in results {
-//!        match result {
-//!            Ok(populated_server) => {
+//!    for server in servers {
+//!        match server {
+//!            ScrapedServer::Populated(populated_server) => {
 //!                 println!("{}", populated_server);
 //!                 populated_server.display();
 //!                 println!();
 //!            }
-//!            Err(e) => {
-//!                panic!("Error: {:?}", e);
+//!            ScrapedServer::Failed(failed_server) => {
+//!                panic!("Error! {} failed scraping: {:?}", failed_server.hostname, failed_server.error);
 //!            }
 //!       }
 //!     }
@@ -64,24 +64,25 @@
 //!
 
 use log::{info, trace, warn};
-use std::time::Instant;
+use std::{fmt::Debug, time::Instant};
 
 mod models;
 mod utilities;
 
 pub mod errors;
 
-use crate::errors::CVMFSScraperError;
-use crate::models::PopulatedServer;
-
-pub use models::{Hostname, Server, ServerBackendType, ServerType};
+pub use errors::{CVMFSScraperError, HostnameError, ManifestError, ScrapeError};
+pub use models::{
+    FailedServer, Hostname, PopulatedRepositoryOrReplica, PopulatedServer, ScrapedServer, Server,
+    ServerBackendType, ServerType,
+};
 
 use futures::future::join_all;
 
-pub async fn scrape_servers(
-    servers: Vec<Server>,
-    repolist: Vec<&str>,
-) -> Vec<Result<PopulatedServer, CVMFSScraperError>> {
+pub async fn scrape_servers<R>(servers: Vec<Server>, repolist: Vec<R>) -> Vec<ScrapedServer>
+where
+    R: AsRef<str> + Debug + std::fmt::Display + Clone,
+{
     let start = Instant::now();
     let scrapes_attempted = servers.len();
     trace!(
@@ -94,30 +95,21 @@ pub async fn scrape_servers(
         async move { server.scrape(repolist.clone()).await }
     });
 
-    let result = join_all(futures).await;
-    let scrapes_succeeded = result.iter().filter(|r| r.is_ok()).count();
+    let scraped_servers = join_all(futures).await;
 
-    for server in servers.iter() {
-        let server_result = result.iter().find(|r| match r {
-            Ok(popserver) => popserver.hostname == server.hostname,
-            Err(_) => false,
-        });
-
-        if server_result.is_none() {
-            let error = result.iter().find_map(|r| match r {
-                Err(e) => Some(e.to_string()),
-                _ => None,
-            });
-
-            if let Some(error) = error {
+    for server in scraped_servers.iter() {
+        match server {
+            ScrapedServer::Populated(popserver) => {
+                info!(
+                    "Scraped server: {} with {} repositories",
+                    popserver.hostname,
+                    popserver.repositories.len()
+                );
+            }
+            ScrapedServer::Failed(failedserver) => {
                 warn!(
                     "Scraping failed for server: {} with error: {}",
-                    server.hostname, error
-                );
-            } else {
-                warn!(
-                    "Scraping failed for server: {} with unknown error",
-                    server.hostname
+                    failedserver.hostname, failedserver.error
                 );
             }
         }
@@ -126,11 +118,14 @@ pub async fn scrape_servers(
     info!(
         "Scraped {} servers ({} succeeded), run duration: {:?}",
         scrapes_attempted,
-        scrapes_succeeded,
+        scraped_servers.iter().filter(|s| s.is_ok()).count(),
         start.elapsed()
     );
-    trace!("Scraping servers completed with results: {:?}", result);
-    result
+    trace!(
+        "Scraping servers completed with results: {:?}",
+        scraped_servers
+    );
+    scraped_servers
 }
 
 #[cfg(test)]
@@ -166,13 +161,13 @@ mod tests {
             let repolist = repolist.clone();
             async move {
                 match server.scrape(repolist.clone()).await {
-                    Ok(popserver) => {
+                    ScrapedServer::Populated(popserver) => {
                         for repo in repolist {
                             assert!(popserver.has_repository(repo));
                         }
                     }
-                    Err(e) => {
-                        panic!("Error: {:?}", e);
+                    ScrapedServer::Failed(failedserver) => {
+                        panic!("Error: {:?}", failedserver.error);
                     }
                 }
             }
@@ -206,13 +201,13 @@ mod tests {
 
         for result in results {
             match result {
-                Ok(popserver) => {
+                ScrapedServer::Populated(popserver) => {
                     for repo in repolist.clone() {
                         assert!(popserver.has_repository(repo));
                     }
                 }
-                Err(e) => {
-                    panic!("Error: {:?}", e);
+                ScrapedServer::Failed(failedserver) => {
+                    panic!("Error: {:?}", failedserver.error);
                 }
             }
         }
@@ -229,11 +224,11 @@ mod tests {
         let repolist = vec!["software.eessi.io", "dev.eessi.io"];
 
         match server.scrape(repolist.clone()).await {
-            Ok(_) => {
+            ScrapedServer::Populated(_) => {
                 panic!("Error, should not have succeeded");
             }
-            Err(e) => {
-                assert_eq!(e.to_string(), "Scrape error: Server type mismatch: aws-eu-central-s1.eessi.science is a Stratum0 server, but replicas were found in the repositories.json");
+            ScrapedServer::Failed(failedserver) => {
+                assert_eq!(failedserver.error.to_string(), "Scrape error: Server type mismatch: aws-eu-central-s1.eessi.science is a Stratum0 server, but replicas were found in the repositories.json");
             }
         }
     }
@@ -247,9 +242,17 @@ mod tests {
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-        let popserver = server.scrape(vec![]).await.unwrap();
+        let repoparams: Vec<String> = Vec::new();
+        let servers = server.scrape(repoparams).await;
         for repo in repolist {
-            assert!(popserver.has_repository(repo))
+            match servers.clone() {
+                ScrapedServer::Populated(popserver) => {
+                    assert!(popserver.has_repository(repo))
+                }
+                ScrapedServer::Failed(failedserver) => {
+                    panic!("Error: {:?}", failedserver.error);
+                }
+            }
         }
     }
 
@@ -262,7 +265,11 @@ mod tests {
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-        let popserver = server.scrape(repolist.clone()).await.unwrap();
+        let popserver = server
+            .scrape(repolist.clone())
+            .await
+            .get_populated_server()
+            .unwrap();
         assert_eq!(popserver.backend_type, ServerBackendType::AutoDetect);
         assert_eq!(popserver.backend_detected, ServerBackendType::CVMFS);
     }
@@ -275,7 +282,10 @@ mod tests {
             Hostname("aws-eu-central-s1.eessi.science".to_string()),
         );
 
-        let popserver = server.scrape(vec![]).await.unwrap();
+        let repoparams: Vec<String> = Vec::new();
+        let popserver = server.scrape(repoparams).await;
+        assert!(popserver.is_ok());
+        let popserver = popserver.get_populated_server().unwrap();
         assert_eq!(popserver.backend_type, ServerBackendType::AutoDetect);
         assert_eq!(popserver.backend_detected, ServerBackendType::CVMFS);
     }
@@ -289,7 +299,11 @@ mod tests {
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-        let popserver = server.scrape(repolist.clone()).await.unwrap();
+        let popserver = server
+            .scrape(repolist.clone())
+            .await
+            .get_populated_server()
+            .unwrap();
         assert_eq!(popserver.backend_type, ServerBackendType::AutoDetect);
         assert_eq!(popserver.backend_detected, ServerBackendType::S3);
     }
@@ -303,7 +317,11 @@ mod tests {
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-        let popserver = server.scrape(repolist.clone()).await.unwrap();
+        let popserver = server
+            .scrape(repolist.clone())
+            .await
+            .get_populated_server()
+            .unwrap();
         assert!(popserver.metadata.schema_version.is_some());
         assert!(popserver.metadata.cvmfs_version.is_some());
         assert!(popserver.metadata.last_geodb_update.is_some());
@@ -330,7 +348,11 @@ mod tests {
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-        let popserver = server.scrape(repolist.clone()).await.unwrap();
+        let popserver = server
+            .scrape(repolist.clone())
+            .await
+            .get_populated_server()
+            .unwrap();
         assert!(popserver.metadata.schema_version.is_none());
         assert!(popserver.metadata.cvmfs_version.is_none());
         assert!(popserver.metadata.last_geodb_update.is_none());

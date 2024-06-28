@@ -1,7 +1,7 @@
 use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
 
-use crate::errors::{CVMFSScraperError, ManifestError, ScrapeError};
+use crate::errors::{CVMFSScraperError, GenericError, ManifestError, ScrapeError};
 use crate::models::cvmfs_published::Manifest;
 use crate::models::cvmfs_status_json::StatusJSON;
 use crate::models::generic::{Hostname, MaybeRfc2822DateTime};
@@ -30,7 +30,7 @@ pub enum ServerType {
 /// The AutoDetect backend type will try to fetch the repositories.json file from the server. If it
 /// fails, it will assume the server is using S3 as the backend. If it succeeds, it will assume the
 /// server is using CVMFS as the backend.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Copy)]
 pub enum ServerBackendType {
     S3,
     CVMFS,
@@ -85,6 +85,51 @@ pub struct PopulatedServer {
     pub metadata: ServerMetadata,
 }
 
+/// A server that failed to scrape.
+///
+/// This struct is used to store information about a server that failed to scrape. It contains the
+/// hostname of the server and the error that occurred.
+#[derive(Debug, Clone)]
+pub struct FailedServer {
+    pub hostname: Hostname,
+    pub server_type: ServerType,
+    pub backend_type: ServerBackendType,
+    pub error: CVMFSScraperError,
+}
+
+#[derive(Debug, Clone)]
+pub enum ScrapedServer {
+    Populated(PopulatedServer),
+    Failed(FailedServer),
+}
+
+impl ScrapedServer {
+    pub fn is_failed(&self) -> bool {
+        matches!(self, ScrapedServer::Failed(_))
+    }
+    pub fn is_ok(&self) -> bool {
+        matches!(self, ScrapedServer::Populated(_))
+    }
+    pub fn get_populated_server(self) -> Result<PopulatedServer, GenericError> {
+        match self {
+            ScrapedServer::Populated(server) => Ok(server),
+            ScrapedServer::Failed(failed) => Err(GenericError::TypeError(format!(
+                "{} is a failed server",
+                failed.hostname
+            ))),
+        }
+    }
+    pub fn get_failed_server(self) -> Result<FailedServer, GenericError> {
+        match self {
+            ScrapedServer::Failed(failed) => Ok(failed),
+            ScrapedServer::Populated(server) => Err(GenericError::TypeError(format!(
+                "{} is a populated server",
+                server.hostname
+            ))),
+        }
+    }
+}
+
 impl Server {
     pub fn new(
         server_type: ServerType,
@@ -99,10 +144,19 @@ impl Server {
         }
     }
 
-    pub async fn scrape(
-        &self,
-        repositories: Vec<&str>,
-    ) -> Result<PopulatedServer, CVMFSScraperError> {
+    pub fn as_failed_server(&self, error: CVMFSScraperError) -> FailedServer {
+        FailedServer {
+            hostname: self.hostname.clone(),
+            server_type: self.server_type,
+            backend_type: self.backend_type,
+            error,
+        }
+    }
+
+    pub async fn scrape<R>(&self, repositories: Vec<R>) -> ScrapedServer
+    where
+        R: AsRef<str> + std::fmt::Display + Clone,
+    {
         debug!("Scraping server {}", self.hostname.0);
         let client = reqwest::Client::new();
         let mut all_repos = repositories
@@ -132,8 +186,16 @@ impl Server {
             ServerBackendType::AutoDetect => match self.fetch_repos_json(&client).await {
                 Ok(repo_json) => {
                     debug!("Detected CVMFS backend for {}", self.hostname.0);
-                    self.validate_repo_json_and_server_type(&repo_json)?;
-                    metadata = MetadataFromRepoJSON::try_from(repo_json.clone())?;
+                    match self.validate_repo_json_and_server_type(&repo_json) {
+                        Ok(_) => {}
+                        Err(error) => return ScrapedServer::Failed(self.as_failed_server(error)),
+                    }
+                    metadata = match MetadataFromRepoJSON::try_from(repo_json.clone()) {
+                        Ok(meta) => meta,
+                        Err(error) => {
+                            return ScrapedServer::Failed(self.as_failed_server(error.into()))
+                        }
+                    };
                     backend_detected = ServerBackendType::CVMFS;
                     all_repos.extend(
                         repo_json
@@ -147,7 +209,7 @@ impl Server {
                         debug!("Detected S3 backend for {}", self.hostname.0);
                         backend_detected = ServerBackendType::S3;
                     }
-                    _ => return Err(CVMFSScraperError::ScrapeError(error)),
+                    _ => return ScrapedServer::Failed(self.as_failed_server(error.into())),
                 },
             },
             ServerBackendType::S3 => {
@@ -156,15 +218,30 @@ impl Server {
                         "Empty repository list with explicit S3 backend: {}",
                         self.hostname.0
                     );
-                    return Err(CVMFSScraperError::ScrapeError(
-                        ScrapeError::EmptyRepositoryList(self.hostname.0.clone()),
+                    return ScrapedServer::Failed(self.as_failed_server(
+                        ScrapeError::EmptyRepositoryList(self.hostname.0.clone()).into(),
                     ));
                 }
             }
             ServerBackendType::CVMFS => {
-                let repo_json = self.fetch_repos_json(&client).await?;
-                metadata = MetadataFromRepoJSON::try_from(repo_json.clone())?;
-                self.validate_repo_json_and_server_type(&repo_json)?;
+                let repo_json = match self.fetch_repos_json(&client).await {
+                    Ok(repo_json) => repo_json,
+                    Err(error) => {
+                        return ScrapedServer::Failed(self.as_failed_server(error.into()))
+                    }
+                };
+                metadata = match MetadataFromRepoJSON::try_from(repo_json.clone()) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        return ScrapedServer::Failed(self.as_failed_server(error.into()))
+                    }
+                };
+                match self.validate_repo_json_and_server_type(&repo_json) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        return ScrapedServer::Failed(self.as_failed_server(error.into()));
+                    }
+                }
                 all_repos.extend(
                     repo_json
                         .repositories_and_replicas()
@@ -176,7 +253,12 @@ impl Server {
 
         for repo in all_repos {
             let repo = RepositoryOrReplica::new(&repo, self);
-            let populated_repo = repo.scrape(&client).await?;
+            let populated_repo = match repo.scrape(&client).await {
+                Ok(repo) => repo,
+                Err(error) => {
+                    return ScrapedServer::Failed(self.as_failed_server(error.into()));
+                }
+            };
             populated_repos.push(populated_repo);
         }
 
@@ -187,7 +269,7 @@ impl Server {
 
         let metadata = self.merge_metadata(metadata, meta_json);
 
-        Ok(PopulatedServer {
+        ScrapedServer::Populated(PopulatedServer {
             server_type: self.server_type,
             backend_type: self.backend_type.clone(),
             backend_detected,
@@ -501,5 +583,8 @@ impl PopulatedRepositoryOrReplica {
         println!("  Last Snapshot: {}", self.last_snapshot);
         println!("  Last GC: {}", self.last_gc);
         self.manifest.display();
+    }
+    pub fn revision(&self) -> i32 {
+        self.manifest.s
     }
 }
