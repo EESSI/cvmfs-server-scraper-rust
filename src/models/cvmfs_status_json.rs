@@ -4,6 +4,7 @@ use crate::models::generic::MaybeRfc2822DateTime;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct StatusJSON {
+    #[serde(default = "MaybeRfc2822DateTime::default")]
     pub last_snapshot: MaybeRfc2822DateTime,
     pub last_gc: MaybeRfc2822DateTime,
 }
