@@ -31,6 +31,8 @@ use super::generic::MaybeRfc2822DateTime;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RepositoriesJSON {
     pub schema: u32,
+    // Default to None, Stratum0 does not have a last_geodb_update field
+    #[serde(default = "MaybeRfc2822DateTime::default")]
     pub last_geodb_update: MaybeRfc2822DateTime,
     pub cvmfs_version: Option<String>,
     pub os_id: Option<String>,
