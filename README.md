@@ -13,7 +13,8 @@ And for each repository, it fetches:
 ## Usage
 
 ```rust
-use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType, scrape_servers};
+use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType, scrape_servers, ScrapedServer};
+use futures::future::join_all;
 
 #[tokio::main]
 async fn main() {
@@ -25,7 +26,7 @@ async fn main() {
         ),
         Server::new(
             ServerType::Stratum1,
-            ServerBackendType::CVMFS,
+            ServerBackendType::AutoDetect,
             Hostname("aws-eu-central-s1.eessi.science".to_string()),
         ),
         Server::new(
@@ -34,22 +35,20 @@ async fn main() {
             Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
         ),
     ];
-
     let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-
-    let results = scrape_servers(servers, repolist).await;
-
-    for result in results {
-        match result {
-            Ok(populated_server) => {
+   // Scrape all servers in parallel
+   let servers = scrape_servers(servers, repolist).await;
+   for server in servers {
+       match server {
+           ScrapedServer::Populated(populated_server) => {
                 println!("{}", populated_server);
                 populated_server.display();
                 println!();
-            }
-            Err(e) => {
-                eprintln!("Error: {:?}", e);
-            }
-        }
+           }
+           ScrapedServer::Failed(failed_server) => {
+               panic!("Error! {} failed scraping: {:?}", failed_server.hostname, failed_server.error);
+           }
+      }
     }
 }
 ```
