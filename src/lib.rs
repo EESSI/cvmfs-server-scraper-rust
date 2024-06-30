@@ -73,8 +73,8 @@ pub mod errors;
 
 pub use errors::{CVMFSScraperError, HostnameError, ManifestError, ScrapeError};
 pub use models::{
-    FailedServer, Hostname, PopulatedRepositoryOrReplica, PopulatedServer, ScrapedServer, Server,
-    ServerBackendType, ServerType,
+    FailedServer, Hostname, Manifest, MaybeRfc2822DateTime, PopulatedRepositoryOrReplica,
+    PopulatedServer, ScrapedServer, Server, ServerBackendType, ServerType,
 };
 
 use futures::future::join_all;

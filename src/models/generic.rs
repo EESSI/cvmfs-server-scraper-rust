@@ -106,6 +106,16 @@ impl<'de> Deserialize<'de> for HexString {
     }
 }
 
+/// A wrapped optional string that may be a RFC 2822 date-time.
+///
+/// Due to the fact that the date-time fields generated into the CVMFS JSON files
+/// are produced with the `date` command, they may be localized to the system
+/// that generated them. This means that the date-time fields may not parsable
+/// with any degree of sanity.
+///
+/// To offer both the option of a time-parsed field and the raw string, we store
+/// the string itself and provide a method (`try_into_datetime`) to attempt to
+/// parse the string into a `DateTime<Utc>`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct MaybeRfc2822DateTime(pub Option<String>);
 

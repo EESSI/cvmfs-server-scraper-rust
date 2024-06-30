@@ -5,7 +5,8 @@ mod meta_json;
 mod repositories_json;
 mod servers;
 
-pub use generic::{HexString, Hostname};
+pub use cvmfs_published::Manifest;
+pub use generic::{HexString, Hostname, MaybeRfc2822DateTime};
 pub use servers::{
     FailedServer, PopulatedRepositoryOrReplica, PopulatedServer, ScrapedServer, Server,
     ServerBackendType, ServerType,

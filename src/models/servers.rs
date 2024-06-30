@@ -548,10 +548,7 @@ impl RepositoryOrReplica {
             self.server.hostname.0, self.name
         );
         let response = client.get(url).send().await?;
-        let content = response.error_for_status()?.text().await?;
-        let content = content.as_str();
-        // println!("{}", content);
-        Manifest::from_str(content)
+        response.error_for_status()?.text().await?.parse()
     }
 
     async fn fetch_repository_status_json(
@@ -569,6 +566,22 @@ impl RepositoryOrReplica {
     }
 }
 
+/// A populated repository or replica object.
+///
+/// This object represents a CVMFS repository or replica that has been scraped for information about
+/// the repository. For fetching the revision of the repository, one can use the `revision` method
+/// as a shortcut to get the revision from the manifest.
+///
+/// Fields:
+///
+/// - name: The name of the repository
+/// - manifest: The manifest of the repository
+/// - last_snapshot: The last time a snapshot was taken (optional)
+/// - last_gc: The last time garbage collection was run (optional)
+///
+/// The MaybeRfc2822DateTime type is used to represent a date and time that may or may not be present,
+/// and may or may not be in the RFC 2822 format. See the documentation for the MaybeRfc2822DateTime
+/// type for more information.
 #[derive(Debug, Serialize, Clone, PartialEq)]
 pub struct PopulatedRepositoryOrReplica {
     pub name: String,
