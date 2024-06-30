@@ -106,14 +106,8 @@ impl<'de> Deserialize<'de> for HexString {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub struct MaybeRfc2822DateTime(pub Option<String>);
-
-impl Default for MaybeRfc2822DateTime {
-    fn default() -> Self {
-        MaybeRfc2822DateTime(None)
-    }
-}
 
 impl std::fmt::Display for MaybeRfc2822DateTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

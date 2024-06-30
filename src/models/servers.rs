@@ -164,7 +164,7 @@ impl Server {
             .map(|repo| repo.to_string())
             .collect::<std::collections::BTreeSet<_>>();
         let mut populated_repos = vec![];
-        let mut backend_detected = self.backend_type.clone();
+        let mut backend_detected = self.backend_type;
 
         let mut metadata = MetadataFromRepoJSON {
             schema_version: None,
@@ -239,7 +239,7 @@ impl Server {
                 match self.validate_repo_json_and_server_type(&repo_json) {
                     Ok(_) => {}
                     Err(error) => {
-                        return ScrapedServer::Failed(self.as_failed_server(error.into()));
+                        return ScrapedServer::Failed(self.as_failed_server(error));
                     }
                 }
                 all_repos.extend(
@@ -256,7 +256,7 @@ impl Server {
             let populated_repo = match repo.scrape(&client).await {
                 Ok(repo) => repo,
                 Err(error) => {
-                    return ScrapedServer::Failed(self.as_failed_server(error.into()));
+                    return ScrapedServer::Failed(self.as_failed_server(error));
                 }
             };
             populated_repos.push(populated_repo);
@@ -271,7 +271,7 @@ impl Server {
 
         ScrapedServer::Populated(PopulatedServer {
             server_type: self.server_type,
-            backend_type: self.backend_type.clone(),
+            backend_type: self.backend_type,
             backend_detected,
             hostname: self.hostname.clone(),
             repositories: populated_repos,
@@ -551,7 +551,7 @@ impl RepositoryOrReplica {
         let content = response.error_for_status()?.text().await?;
         let content = content.as_str();
         // println!("{}", content);
-        Manifest::from_str(&content)
+        Manifest::from_str(content)
     }
 
     async fn fetch_repository_status_json(
