@@ -1,4 +1,6 @@
 use log::trace;
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -61,6 +63,21 @@ pub fn parse_timestamp_field(
         })
 }
 
+pub async fn fetch_text<T>(client: &Client, url: T) -> Result<String, ScrapeError>
+where
+    T: Display,
+{
+    trace!("Fetching text from {}", url);
+    let response = client
+        .get(url.to_string())
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    Ok(response)
+}
+
 pub async fn fetch_json<T, U>(client: &Client, url: T) -> Result<U, ScrapeError>
 where
     T: Display,
@@ -78,6 +95,15 @@ where
     let json: U = serde_json::from_str(&response)?;
     Ok(json)
 }
+
+pub fn generate_random_string(length: usize) -> String {
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(length)
+        .map(char::from)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

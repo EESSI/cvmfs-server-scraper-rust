@@ -50,6 +50,22 @@ impl std::fmt::Display for Hostname {
     }
 }
 
+impl TryFrom<&str> for Hostname {
+    type Error = HostnameError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl TryFrom<String> for Hostname {
+    type Error = HostnameError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
 impl Hostname {
     pub fn as_str(&self) -> &str {
         &self.0

@@ -13,11 +13,11 @@ And for each repository, it fetches:
 ## Usage
 
 ```rust
-use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType, scrape_servers, ScrapedServer};
-use futures::future::join_all;
+use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType,
+    ScrapedServer, ScraperCommon, Scraper, CVMFSScraperError, DEFAULT_GEOAPI_SERVERS};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), CVMFSScraperError> {
     let servers = vec![
         Server::new(
             ServerType::Stratum1,
@@ -36,20 +36,29 @@ async fn main() {
         ),
     ];
     let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-   // Scrape all servers in parallel
-   let servers = scrape_servers(servers, repolist).await;
-   for server in servers {
-       match server {
-           ScrapedServer::Populated(populated_server) => {
-                println!("{}", populated_server);
-                populated_server.display();
-                println!();
-           }
-           ScrapedServer::Failed(failed_server) => {
+    let ignored_repos = vec!["nope.eessi.io"];
+
+    // Build a Scraper and scrape all servers in parallel
+    let scraped_servers = Scraper::new()
+       .forced_repositories(repolist)
+       .ignored_repositories(ignored_repos)
+       .geoapi_servers(DEFAULT_GEOAPI_SERVERS.clone())? // This is the default list
+       .with_servers(servers) // Transitions to a WithServer state.
+       .validate()? // Transitions to a ValidatedAndReady state, now immutable.
+       .scrape().await; // Perform the scrape, return servers.
+    for server in scraped_servers {
+        match server {
+            ScrapedServer::Populated(populated_server) => {
+               println!("{}", populated_server);
+               populated_server.display();
+               println!();
+            }
+            ScrapedServer::Failed(failed_server) => {
                panic!("Error! {} failed scraping: {:?}", failed_server.hostname, failed_server.error);
-           }
-      }
+            }
+        }
     }
+    Ok(())
 }
 ```
 

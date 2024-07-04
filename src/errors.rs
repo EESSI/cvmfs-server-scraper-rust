@@ -59,6 +59,9 @@ pub enum ScrapeError {
 
     #[error("Conversion error: {0}")]
     ConversionError(String),
+
+    #[error("GeoAPI failure: {0}")]
+    GeoAPIFailure(String),
 }
 
 #[derive(Error, Debug, Clone)]
@@ -98,5 +101,13 @@ impl From<reqwest::Error> for ScrapeError {
 impl From<serde_json::Error> for ScrapeError {
     fn from(error: serde_json::Error) -> Self {
         ScrapeError::ParseError(Arc::new(error))
+    }
+}
+
+// For when we try to convert Hostname to Hostname. We get an infallible
+// conversion error, which we can safely ignore.
+impl From<std::convert::Infallible> for HostnameError {
+    fn from(_: std::convert::Infallible) -> Self {
+        unreachable!("Infallible conversions cannot fail")
     }
 }

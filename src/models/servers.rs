@@ -1,13 +1,14 @@
-use log::{debug, error, trace};
+use log::{debug, error, trace, warn};
 use serde::{Deserialize, Serialize};
 
+use crate::constants::DEFAULT_GEOAPI_SERVERS;
 use crate::errors::{CVMFSScraperError, GenericError, ManifestError, ScrapeError};
-use crate::models::cvmfs_published::Manifest;
 use crate::models::cvmfs_status_json::StatusJSON;
-use crate::models::generic::{Hostname, MaybeRfc2822DateTime};
+use crate::models::geoapi::GeoapiServerQuery;
 use crate::models::meta_json::MetaJSON;
 use crate::models::repositories_json::RepositoriesJSON;
-use crate::utilities::fetch_json;
+use crate::models::{Hostname, Manifest, MaybeRfc2822DateTime};
+use crate::utilities::{fetch_json, fetch_text, generate_random_string};
 
 /// The type of server we're dealing with.
 ///
@@ -21,7 +22,7 @@ pub enum ServerType {
     SyncServer,
 }
 
-/// The type of backend the server is using.
+/// The type of backend a given server is using.
 ///
 /// S3: The server is using S3 as the backend.
 /// CVMFS: The server is using a standard CVMFS web server as the backend.
@@ -83,6 +84,7 @@ pub struct PopulatedServer {
     pub hostname: Hostname,
     pub repositories: Vec<PopulatedRepositoryOrReplica>,
     pub metadata: ServerMetadata,
+    pub geoapi: GeoapiServerQuery,
 }
 
 /// A server that failed to scrape.
@@ -153,15 +155,44 @@ impl Server {
         }
     }
 
-    pub async fn scrape<R>(&self, repositories: Vec<R>) -> ScrapedServer
+    /// Scrape the server for information about itself and its repos.
+    ///
+    /// This method will scrape the server for information about the repositories it hosts. It will
+    /// also fetch metadata about the server from the repositories.json and meta.json files, if they
+    /// are available.
+    ///
+    /// The method takes a list of repositories to scrape (which may be empty unless the backend is S3)
+    /// and a list of repositories to ignore (this may be empty). It also takes an optional list of
+    /// geoapi servers to use when fetching geoapi information.
+    ///
+    /// The method will return a populated server object if the scrape is successful, or a failed server
+    /// object if the scrape fails.
+    pub async fn scrape<R>(
+        &self,
+        repositories: Vec<R>,
+        ignored_repositories: Vec<R>,
+        geoapi_servers: Option<Vec<Hostname>>,
+    ) -> ScrapedServer
     where
         R: AsRef<str> + std::fmt::Display + Clone,
     {
         debug!("Scraping server {}", self.hostname.0);
+
+        let geoapi_servers = match geoapi_servers {
+            Some(servers) => servers,
+            None => DEFAULT_GEOAPI_SERVERS.clone(),
+        };
+
+        let ignore = ignored_repositories
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+
         let client = reqwest::Client::new();
         let mut all_repos = repositories
             .iter()
             .map(|repo| repo.to_string())
+            .filter(|repo| !ignore.contains(repo))
             .collect::<std::collections::BTreeSet<_>>();
         let mut populated_repos = vec![];
         let mut backend_detected = self.backend_type;
@@ -201,6 +232,7 @@ impl Server {
                         repo_json
                             .repositories_and_replicas()
                             .into_iter()
+                            .filter(|r| !ignore.contains(&r.name))
                             .map(|r| r.name),
                     );
                 }
@@ -246,6 +278,7 @@ impl Server {
                     repo_json
                         .repositories_and_replicas()
                         .into_iter()
+                        .filter(|r| !ignore.contains(&r.name))
                         .map(|r| r.name),
                 );
             }
@@ -268,6 +301,28 @@ impl Server {
         };
 
         let metadata = self.merge_metadata(metadata, meta_json);
+        let geoapi = if populated_repos.len() > 0 {
+            match self
+                .fetch_geoapi(
+                    &client,
+                    &populated_repos[0].name,
+                    &backend_detected,
+                    geoapi_servers,
+                )
+                .await
+            {
+                Ok(geoapi) => geoapi,
+                Err(error) => {
+                    return ScrapedServer::Failed(self.as_failed_server(error.into()));
+                }
+            }
+        } else {
+            GeoapiServerQuery {
+                hostname: self.hostname.clone(),
+                geoapi_hosts: geoapi_servers,
+                response: Vec::new(),
+            }
+        };
 
         ScrapedServer::Populated(PopulatedServer {
             server_type: self.server_type,
@@ -276,6 +331,7 @@ impl Server {
             hostname: self.hostname.clone(),
             repositories: populated_repos,
             metadata,
+            geoapi,
         })
     }
 
@@ -296,6 +352,69 @@ impl Server {
             format!("http://{}/cvmfs/info/v1/meta.json", self.hostname.0),
         )
         .await
+    }
+
+    async fn fetch_geoapi(
+        &self,
+        client: &reqwest::Client,
+        repository_name: &String,
+        backend_type: &ServerBackendType,
+        geoapi_hosts: Vec<Hostname>,
+    ) -> Result<GeoapiServerQuery, ScrapeError> {
+        // S3 servers do not have GeoAPI support. S3 _is_ the GeoAPI.
+        if *backend_type == ServerBackendType::S3 {
+            debug!("Skipping GeoAPI for S3 server {}", self.hostname.0);
+            return Ok(GeoapiServerQuery {
+                hostname: self.hostname.clone(),
+                geoapi_hosts,
+                response: Vec::new(),
+            });
+        }
+
+        let random_string = generate_random_string(12);
+        trace!(
+            "Fetching geoapi for {} (using {} as the random string)",
+            self.hostname.0,
+            random_string
+        );
+        let url = format!(
+            "http://{}/cvmfs/{}/api/v1.0/geo/{}/{}",
+            self.hostname.0,
+            repository_name,
+            random_string,
+            geoapi_hosts
+                .iter()
+                .map(|hostname| hostname.as_str())
+                .collect::<Vec<&str>>()
+                .join(",")
+        );
+        let response = match fetch_text(client, &url).await {
+            Ok(response) => {
+                debug!("Fetched geoapi: {} -> {}", url, response);
+                response
+                    .trim()
+                    .split(',')
+                    .map(|x| {
+                        x.parse::<u32>()
+                            .map_err(|e| ScrapeError::GeoAPIFailure(e.to_string()))
+                    })
+                    .collect::<Result<Vec<u32>, ScrapeError>>()?
+            }
+            Err(_) => {
+                let error_string = format!(
+                    "Failed to fetch geoapi for {} on {:?} (with {})",
+                    self.hostname.0, self.backend_type, random_string
+                );
+                warn!("{}", error_string);
+                return Err(ScrapeError::GeoAPIFailure(error_string));
+            }
+        };
+
+        Ok(GeoapiServerQuery {
+            hostname: self.hostname.clone(),
+            geoapi_hosts,
+            response,
+        })
     }
 
     fn validate_repo_json_and_server_type(
@@ -380,6 +499,13 @@ impl PopulatedServer {
         for repo in &self.repositories {
             println!("  {}", repo.name);
             repo.display();
+        }
+
+        if self.backend_detected != ServerBackendType::S3 {
+            println!("GeoAPI:");
+            self.geoapi.display();
+        } else {
+            println!("GeoAPI: Not available for S3 servers.");
         }
     }
 
@@ -582,7 +708,7 @@ impl RepositoryOrReplica {
 /// The MaybeRfc2822DateTime type is used to represent a date and time that may or may not be present,
 /// and may or may not be in the RFC 2822 format. See the documentation for the MaybeRfc2822DateTime
 /// type for more information.
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct PopulatedRepositoryOrReplica {
     pub name: String,
     pub manifest: Manifest,

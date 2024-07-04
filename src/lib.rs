@@ -19,11 +19,11 @@
 //! # Examples
 //!
 //! ```no_run
-//! use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType, scrape_servers, ScrapedServer};
-//! use futures::future::join_all;
+//! use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType
+//!     ScrapedServer, ScraperCommon, Scraper, CVMFSScraperError, DEFAULT_GEOAPI_SERVERS};
 //!
 //! #[tokio::main]
-//! async fn main() {
+//! async fn main() -> Result<(), CVMFSScraperError> {
 //!     let servers = vec![
 //!         Server::new(
 //!             ServerType::Stratum1,
@@ -43,11 +43,18 @@
 //!     ];
 //!
 //!     let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
+//!     let ignored_repos = vec!["nope.eessi.io"];
 //!
-//!    // Scrape all servers in parallel
-//!    let servers = scrape_servers(servers, repolist).await;
+//!    // Build a Scraper and scrape all servers in parallel
+//!    let scraped_servers = Scraper::new()
+//!       .forced_repositories(repolist)
+//!       .ignored_repositories(ignored_repos)
+//!       .geoapi_servers(DEFAULT_GEOAPI_SERVERS.clone())? // This is the default list
+//!       .with_servers(servers) // Transitions to a WithServer state.
+//!       .validate()? // Transitions to a ValidatedAndReady state, now immutable.
+//!       .scrape().await; // Perform the scrape, return servers.
 //!
-//!    for server in servers {
+//!    for server in scraped_servers {
 //!        match server {
 //!            ScrapedServer::Populated(populated_server) => {
 //!                 println!("{}", populated_server);
@@ -59,74 +66,24 @@
 //!            }
 //!       }
 //!     }
+//!     Ok(())
 //! }
 //! ```
-//!
 
-use log::{info, trace, warn};
-use std::{fmt::Debug, time::Instant};
-
+mod constants;
+mod errors;
 mod models;
+mod scraper;
 mod utilities;
 
-pub mod errors;
-
+pub use constants::DEFAULT_GEOAPI_SERVERS;
 pub use errors::{CVMFSScraperError, HostnameError, ManifestError, ScrapeError};
 pub use models::{
-    FailedServer, Hostname, Manifest, MaybeRfc2822DateTime, PopulatedRepositoryOrReplica,
-    PopulatedServer, ScrapedServer, Server, ServerBackendType, ServerType,
+    FailedServer, GeoapiServerQuery, Hostname, Manifest, MaybeRfc2822DateTime,
+    PopulatedRepositoryOrReplica, PopulatedServer, ScrapedServer, Server, ServerBackendType,
+    ServerMetadata, ServerType,
 };
-
-use futures::future::join_all;
-
-pub async fn scrape_servers<R>(servers: Vec<Server>, repolist: Vec<R>) -> Vec<ScrapedServer>
-where
-    R: AsRef<str> + Debug + std::fmt::Display + Clone,
-{
-    let start = Instant::now();
-    let scrapes_attempted = servers.len();
-    trace!(
-        "Start of scraping run. Servers: {:?}, repositories: {:?}",
-        servers,
-        repolist
-    );
-    let futures = servers.iter().map(|server| {
-        let repolist = repolist.clone();
-        async move { server.scrape(repolist.clone()).await }
-    });
-
-    let scraped_servers = join_all(futures).await;
-
-    for server in scraped_servers.iter() {
-        match server {
-            ScrapedServer::Populated(popserver) => {
-                info!(
-                    "Scraped server: {} with {} repositories",
-                    popserver.hostname,
-                    popserver.repositories.len()
-                );
-            }
-            ScrapedServer::Failed(failedserver) => {
-                warn!(
-                    "Scraping failed for server: {} with error: {}",
-                    failedserver.hostname, failedserver.error
-                );
-            }
-        }
-    }
-
-    info!(
-        "Scraped {} servers ({} succeeded), run duration: {:?}",
-        scrapes_attempted,
-        scraped_servers.iter().filter(|s| s.is_ok()).count(),
-        start.elapsed()
-    );
-    trace!(
-        "Scraping servers completed with results: {:?}",
-        scraped_servers
-    );
-    scraped_servers
-}
+pub use scraper::{Scraper, ScraperCommon};
 
 #[cfg(test)]
 mod tests {
@@ -160,7 +117,7 @@ mod tests {
         let futures = servers.into_iter().map(|server| {
             let repolist = repolist.clone();
             async move {
-                match server.scrape(repolist.clone()).await {
+                match server.scrape(repolist.clone(), vec![], None).await {
                     ScrapedServer::Populated(popserver) => {
                         for repo in repolist {
                             assert!(popserver.has_repository(repo));
@@ -177,43 +134,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_online_cvmfs_servers_using_scan_servers() {
-        let servers = vec![
-            Server::new(
-                ServerType::Stratum1,
-                ServerBackendType::CVMFS,
-                Hostname("azure-us-east-s1.eessi.science".to_string()),
-            ),
-            Server::new(
-                ServerType::Stratum1,
-                ServerBackendType::CVMFS,
-                Hostname("aws-eu-central-s1.eessi.science".to_string()),
-            ),
-            Server::new(
-                ServerType::SyncServer,
-                ServerBackendType::S3,
-                Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
-            ),
-        ];
-
-        let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-        let results = scrape_servers(servers, repolist.clone()).await;
-
-        for result in results {
-            match result {
-                ScrapedServer::Populated(popserver) => {
-                    for repo in repolist.clone() {
-                        assert!(popserver.has_repository(repo));
-                    }
-                }
-                ScrapedServer::Failed(failedserver) => {
-                    panic!("Error: {:?}", failedserver.error);
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn test_online_cvmfs_server_mismatch_s0_is_s1() {
         let server = Server::new(
             ServerType::Stratum0,
@@ -223,7 +143,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io"];
 
-        match server.scrape(repolist.clone()).await {
+        match server.scrape(repolist.clone(), vec![], None).await {
             ScrapedServer::Populated(_) => {
                 panic!("Error, should not have succeeded");
             }
@@ -243,7 +163,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let repoparams: Vec<String> = Vec::new();
-        let servers = server.scrape(repoparams).await;
+        let servers = server.scrape(repoparams, vec![], None).await;
         for repo in repolist {
             match servers.clone() {
                 ScrapedServer::Populated(popserver) => {
@@ -266,7 +186,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let popserver = server
-            .scrape(repolist.clone())
+            .scrape(repolist.clone(), vec![], None)
             .await
             .get_populated_server()
             .unwrap();
@@ -283,7 +203,7 @@ mod tests {
         );
 
         let repoparams: Vec<String> = Vec::new();
-        let popserver = server.scrape(repoparams).await;
+        let popserver = server.scrape(repoparams, vec![], None).await;
         assert!(popserver.is_ok());
         let popserver = popserver.get_populated_server().unwrap();
         assert_eq!(popserver.backend_type, ServerBackendType::AutoDetect);
@@ -300,7 +220,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let popserver = server
-            .scrape(repolist.clone())
+            .scrape(repolist.clone(), vec![], None)
             .await
             .get_populated_server()
             .unwrap();
@@ -318,7 +238,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let popserver = server
-            .scrape(repolist.clone())
+            .scrape(repolist.clone(), vec![], None)
             .await
             .get_populated_server()
             .unwrap();
@@ -349,7 +269,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let popserver = server
-            .scrape(repolist.clone())
+            .scrape(repolist.clone(), vec![], None)
             .await
             .get_populated_server()
             .unwrap();
@@ -359,5 +279,92 @@ mod tests {
         assert!(popserver.metadata.os_version_id.is_none());
         assert!(popserver.metadata.os_pretty_name.is_none());
         assert!(popserver.metadata.os_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_online_cvmfs_server_s1_ignored_repos() {
+        let server = Server::new(
+            ServerType::Stratum1,
+            ServerBackendType::CVMFS,
+            Hostname("aws-eu-central-s1.eessi.science".to_string()),
+        );
+
+        let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
+        let ignored_repos = vec!["riscv.eessi.io"];
+        let popserver = server
+            .scrape(repolist.clone(), ignored_repos.clone(), None)
+            .await
+            .get_populated_server()
+            .unwrap();
+        assert!(popserver.has_repository("software.eessi.io"));
+        assert!(popserver.has_repository("dev.eessi.io"));
+        assert!(!popserver.has_repository("riscv.eessi.io"));
+    }
+
+    #[tokio::test]
+    async fn test_online_scraping_using_builder_interface() {
+        let scraper = Scraper::new();
+        let scraper = scraper
+            .forced_repositories(vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"])
+            .geoapi_servers(vec![DEFAULT_GEOAPI_SERVERS[0].clone()])
+            .unwrap()
+            .with_servers(vec![
+                Server::new(
+                    ServerType::Stratum1,
+                    ServerBackendType::CVMFS,
+                    Hostname("azure-us-east-s1.eessi.science".to_string()),
+                ),
+                Server::new(
+                    ServerType::Stratum1,
+                    ServerBackendType::AutoDetect,
+                    Hostname("aws-eu-central-s1.eessi.science".to_string()),
+                ),
+                Server::new(
+                    ServerType::SyncServer,
+                    ServerBackendType::S3,
+                    Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
+                ),
+            ]);
+
+        let results = scraper.validate().unwrap().scrape().await;
+        for result in results {
+            match result {
+                ScrapedServer::Populated(popserver) => {
+                    for repo in vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"] {
+                        assert!(popserver.has_repository(repo));
+                    }
+                }
+                ScrapedServer::Failed(failedserver) => {
+                    panic!("Error: {:?}", failedserver.error);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_online_geoapi() {
+        let repos = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
+        let scraper = Scraper::new();
+        let scraper = scraper
+            .forced_repositories(repos.clone())
+            .with_servers(vec![Server::new(
+                ServerType::Stratum1,
+                ServerBackendType::AutoDetect,
+                Hostname("aws-eu-central-s1.eessi.science".to_string()),
+            )]);
+
+        let results = scraper.validate().unwrap().scrape().await;
+        for result in results {
+            match result {
+                ScrapedServer::Populated(popserver) => {
+                    let geoapi = popserver.geoapi.clone();
+                    let responses = geoapi.response.clone();
+                    assert_eq!(responses.len(), repos.len());
+                }
+                ScrapedServer::Failed(failedserver) => {
+                    panic!("Error: {:?}", failedserver.error);
+                }
+            }
+        }
     }
 }

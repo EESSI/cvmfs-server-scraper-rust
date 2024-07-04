@@ -28,7 +28,7 @@ use super::generic::MaybeRfc2822DateTime;
 //     ]
 //   }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct RepositoriesJSON {
     pub schema: u32,
     // Default to None, Stratum0 does not have a last_geodb_update field
@@ -54,7 +54,7 @@ impl RepositoriesJSON {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct RepositoriesJSONRepo {
     pub name: String,
     pub url: String,
