@@ -16,7 +16,7 @@ pub struct ValidatedAndReady;
 /// A scraper for CVMFS servers.
 ///
 /// This struct provides a builder interface for scraping CVMFS servers, and it has three
-/// states: WithoutServers, WithServers, and ValidatedAndReady. The scraper can be created
+/// states: WithoutServers, WithServers, and ValidatedAndReady. The scraper is created
 /// with the new() method, and then servers can be added with the with_servers() method.
 ///
 /// Transitions:
@@ -41,12 +41,12 @@ pub struct ValidatedAndReady;
 ///         Server::new(
 ///             ServerType::Stratum1,
 ///             ServerBackendType::CVMFS,
-///             Hostname("azure-us-east-s1.eessi.science".to_string()),
+///             Hostname::try_from("azure-us-east-s1.eessi.science").unwrap(),
 ///         ),
 ///         Server::new(
 ///             ServerType::Stratum1,
 ///             ServerBackendType::AutoDetect,
-///             Hostname("aws-eu-central-s1.eessi.science".to_string()),
+///             Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
 ///         ),
 ///     ];
 ///    
@@ -381,17 +381,17 @@ mod tests {
             Server::new(
                 ServerType::Stratum1,
                 ServerBackendType::CVMFS,
-                Hostname("azure-us-east-s1.eessi.science".to_string()),
+                Hostname::try_from("azure-us-east-s1.eessi.science").unwrap(),
             ),
             Server::new(
                 ServerType::Stratum1,
                 ServerBackendType::CVMFS,
-                Hostname("aws-eu-central-s1.eessi.science".to_string()),
+                Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
             ),
             Server::new(
                 ServerType::SyncServer,
                 ServerBackendType::S3,
-                Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
+                Hostname::try_from("aws-eu-west-s1-sync.eessi.science").unwrap(),
             ),
         ];
 

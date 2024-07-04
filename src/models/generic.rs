@@ -8,12 +8,12 @@ use crate::errors::{HostnameError, ManifestError, ScrapeError};
 /// This type is used to represent a hostname string. It is a wrapper around a `String` and
 /// provides validation for hostnames.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub struct Hostname(pub String);
+pub struct Hostname(String);
 
 impl std::str::FromStr for Hostname {
     type Err = HostnameError;
 
-    fn from_str(s: &str) -> Result<Self, HostnameError> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.len() > 255 {
             return Err(HostnameError::TooLong(s.to_string()));
         }
@@ -67,11 +67,11 @@ impl TryFrom<String> for Hostname {
 }
 
 impl Hostname {
-    pub fn as_str(&self) -> &str {
+    pub fn to_str(&self) -> &str {
         &self.0
     }
 
-    pub fn as_string(&self) -> String {
+    pub fn to_string(&self) -> String {
         self.0.clone()
     }
 }
@@ -274,12 +274,12 @@ mod tests {
     #[test]
     fn test_hostname_as_str() {
         let hostname = Hostname("example.com".to_string());
-        assert_eq!(hostname.as_str(), "example.com");
+        assert_eq!(hostname.to_str(), "example.com");
     }
 
     #[test]
     fn test_hostname_as_string() {
         let hostname = Hostname("example.com".to_string());
-        assert_eq!(hostname.as_string(), "example.com");
+        assert_eq!(hostname.to_string(), "example.com");
     }
 }

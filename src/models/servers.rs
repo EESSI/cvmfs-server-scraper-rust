@@ -138,7 +138,7 @@ impl Server {
         backend_type: ServerBackendType,
         hostname: Hostname,
     ) -> Self {
-        trace!("Creating server object for {}", hostname.0);
+        trace!("Creating server object for {}", hostname);
         Server {
             server_type,
             backend_type,
@@ -176,7 +176,7 @@ impl Server {
     where
         R: AsRef<str> + std::fmt::Display + Clone,
     {
-        debug!("Scraping server {}", self.hostname.0);
+        debug!("Scraping server {}", self.hostname);
 
         let geoapi_servers = match geoapi_servers {
             Some(servers) => servers,
@@ -216,7 +216,7 @@ impl Server {
         match self.backend_type {
             ServerBackendType::AutoDetect => match self.fetch_repos_json(&client).await {
                 Ok(repo_json) => {
-                    debug!("Detected CVMFS backend for {}", self.hostname.0);
+                    debug!("Detected CVMFS backend for {}", self.hostname);
                     match self.validate_repo_json_and_server_type(&repo_json) {
                         Ok(_) => {}
                         Err(error) => return ScrapedServer::Failed(self.as_failed_server(error)),
@@ -238,7 +238,7 @@ impl Server {
                 }
                 Err(error) => match error {
                     ScrapeError::FetchError(_) => {
-                        debug!("Detected S3 backend for {}", self.hostname.0);
+                        debug!("Detected S3 backend for {}", self.hostname);
                         backend_detected = ServerBackendType::S3;
                     }
                     _ => return ScrapedServer::Failed(self.as_failed_server(error.into())),
@@ -248,10 +248,10 @@ impl Server {
                 if all_repos.is_empty() {
                     error!(
                         "Empty repository list with explicit S3 backend: {}",
-                        self.hostname.0
+                        self.hostname
                     );
                     return ScrapedServer::Failed(self.as_failed_server(
-                        ScrapeError::EmptyRepositoryList(self.hostname.0.clone()).into(),
+                        ScrapeError::EmptyRepositoryList(self.hostname.to_string()).into(),
                     ));
                 }
             }
@@ -341,7 +341,7 @@ impl Server {
     ) -> Result<RepositoriesJSON, ScrapeError> {
         fetch_json(
             client,
-            format!("http://{}/cvmfs/info/v1/repositories.json", self.hostname.0),
+            format!("http://{}/cvmfs/info/v1/repositories.json", self.hostname),
         )
         .await
     }
@@ -349,7 +349,7 @@ impl Server {
     async fn fetch_meta_json(&self, client: &reqwest::Client) -> Result<MetaJSON, ScrapeError> {
         fetch_json(
             client,
-            format!("http://{}/cvmfs/info/v1/meta.json", self.hostname.0),
+            format!("http://{}/cvmfs/info/v1/meta.json", self.hostname),
         )
         .await
     }
@@ -363,7 +363,7 @@ impl Server {
     ) -> Result<GeoapiServerQuery, ScrapeError> {
         // S3 servers do not have GeoAPI support. S3 _is_ the GeoAPI.
         if *backend_type == ServerBackendType::S3 {
-            debug!("Skipping GeoAPI for S3 server {}", self.hostname.0);
+            debug!("Skipping GeoAPI for S3 server {}", self.hostname);
             return Ok(GeoapiServerQuery {
                 hostname: self.hostname.clone(),
                 geoapi_hosts,
@@ -374,17 +374,17 @@ impl Server {
         let random_string = generate_random_string(12);
         trace!(
             "Fetching geoapi for {} (using {} as the random string)",
-            self.hostname.0,
+            self.hostname,
             random_string
         );
         let url = format!(
             "http://{}/cvmfs/{}/api/v1.0/geo/{}/{}",
-            self.hostname.0,
+            self.hostname,
             repository_name,
             random_string,
             geoapi_hosts
                 .iter()
-                .map(|hostname| hostname.as_str())
+                .map(|hostname| hostname.to_str())
                 .collect::<Vec<&str>>()
                 .join(",")
         );
@@ -403,7 +403,7 @@ impl Server {
             Err(_) => {
                 let error_string = format!(
                     "Failed to fetch geoapi for {} on {:?} (with {})",
-                    self.hostname.0, self.backend_type, random_string
+                    self.hostname, self.backend_type, random_string
                 );
                 warn!("{}", error_string);
                 return Err(ScrapeError::GeoAPIFailure(error_string));
@@ -421,24 +421,24 @@ impl Server {
         &self,
         repo_json: &RepositoriesJSON,
     ) -> Result<(), CVMFSScraperError> {
-        trace!("Validating {}", self.hostname.0);
+        trace!("Validating {}", self.hostname);
         match (self.server_type, repo_json.replicas.is_empty()) {
             (ServerType::Stratum0, false) => Err(CVMFSScraperError::ScrapeError(
                 ScrapeError::ServerTypeMismatch(format!(
                     "{} is a Stratum0 server, but replicas were found in the repositories.json",
-                    self.hostname.0
+                    self.hostname
                 )),
             )),
             (ServerType::Stratum1, true) => Err(CVMFSScraperError::ScrapeError(
                 ScrapeError::ServerTypeMismatch(format!(
                     "{} is a Stratum1 server, but no replicas were found in the repositories.json",
-                    self.hostname.0
+                    self.hostname
                 )),
             )),
             (ServerType::SyncServer, true) => Err(CVMFSScraperError::ScrapeError(
                 ScrapeError::ServerTypeMismatch(format!(
                     "{} is a SyncServer, but no replicas were found in the repositories.json",
-                    self.hostname.0
+                    self.hostname
                 )),
             )),
             _ => Ok(()),
@@ -477,7 +477,7 @@ impl std::fmt::Display for PopulatedServer {
         write!(
             f,
             "{} ({:?}, {:?})",
-            self.hostname.0, self.server_type, self.backend_type
+            self.hostname, self.server_type, self.backend_type
         )
     }
 }
@@ -671,7 +671,7 @@ impl RepositoryOrReplica {
     ) -> Result<Manifest, ManifestError> {
         let url = format!(
             "http://{}/cvmfs/{}/.cvmfspublished",
-            self.server.hostname.0, self.name
+            self.server.hostname, self.name
         );
         let response = client.get(url).send().await?;
         response.error_for_status()?.text().await?.parse()
@@ -685,7 +685,7 @@ impl RepositoryOrReplica {
             client,
             format!(
                 "http://{}/cvmfs/{}/.cvmfs_status.json",
-                self.server.hostname.0, self.name
+                self.server.hostname, self.name
             ),
         )
         .await

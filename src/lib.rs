@@ -19,7 +19,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType
+//! use cvmfs_server_scraper::{Hostname, Server, ServerBackendType, ServerType,
 //!     ScrapedServer, ScraperCommon, Scraper, CVMFSScraperError, DEFAULT_GEOAPI_SERVERS};
 //!
 //! #[tokio::main]
@@ -28,17 +28,17 @@
 //!         Server::new(
 //!             ServerType::Stratum1,
 //!             ServerBackendType::CVMFS,
-//!             Hostname("azure-us-east-s1.eessi.science".to_string()),
+//!             Hostname::try_from("azure-us-east-s1.eessi.science").unwrap(),
 //!         ),
 //!         Server::new(
 //!             ServerType::Stratum1,
 //!             ServerBackendType::AutoDetect,
-//!             Hostname("aws-eu-central-s1.eessi.science".to_string()),
+//!             Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
 //!         ),
 //!         Server::new(
 //!             ServerType::SyncServer,
 //!             ServerBackendType::S3,
-//!             Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
+//!             Hostname::try_from("aws-eu-west-s1-sync.eessi.science").unwrap(),
 //!         ),
 //!     ];
 //!
@@ -98,17 +98,17 @@ mod tests {
             Server::new(
                 ServerType::Stratum1,
                 ServerBackendType::CVMFS,
-                Hostname("azure-us-east-s1.eessi.science".to_string()),
+                Hostname::try_from("azure-us-east-s1.eessi.science").unwrap(),
             ),
             Server::new(
                 ServerType::Stratum1,
                 ServerBackendType::CVMFS,
-                Hostname("aws-eu-central-s1.eessi.science".to_string()),
+                Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
             ),
             Server::new(
                 ServerType::SyncServer,
                 ServerBackendType::S3,
-                Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
+                Hostname::try_from("aws-eu-west-s1-sync.eessi.science").unwrap(),
             ),
         ];
 
@@ -138,7 +138,7 @@ mod tests {
         let server = Server::new(
             ServerType::Stratum0,
             ServerBackendType::CVMFS,
-            Hostname("aws-eu-central-s1.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io"];
@@ -158,7 +158,7 @@ mod tests {
         let server = Server::new(
             ServerType::Stratum1,
             ServerBackendType::CVMFS,
-            Hostname("aws-eu-central-s1.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
@@ -181,7 +181,7 @@ mod tests {
         let server = Server::new(
             ServerType::Stratum1,
             ServerBackendType::AutoDetect,
-            Hostname("aws-eu-central-s1.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
@@ -199,7 +199,7 @@ mod tests {
         let server = Server::new(
             ServerType::Stratum1,
             ServerBackendType::AutoDetect,
-            Hostname("aws-eu-central-s1.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
         );
 
         let repoparams: Vec<String> = Vec::new();
@@ -215,7 +215,7 @@ mod tests {
         let server = Server::new(
             ServerType::Stratum1,
             ServerBackendType::AutoDetect,
-            Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-west-s1-sync.eessi.science").unwrap(),
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
@@ -233,7 +233,7 @@ mod tests {
         let server = Server::new(
             ServerType::Stratum1,
             ServerBackendType::CVMFS,
-            Hostname("aws-eu-central-s1.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
@@ -264,7 +264,7 @@ mod tests {
         let server = Server::new(
             ServerType::SyncServer,
             ServerBackendType::S3,
-            Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-west-s1-sync.eessi.science").unwrap(),
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
@@ -286,7 +286,7 @@ mod tests {
         let server = Server::new(
             ServerType::Stratum1,
             ServerBackendType::CVMFS,
-            Hostname("aws-eu-central-s1.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
         );
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
@@ -312,17 +312,17 @@ mod tests {
                 Server::new(
                     ServerType::Stratum1,
                     ServerBackendType::CVMFS,
-                    Hostname("azure-us-east-s1.eessi.science".to_string()),
+                    Hostname::try_from("azure-us-east-s1.eessi.science").unwrap(),
                 ),
                 Server::new(
                     ServerType::Stratum1,
                     ServerBackendType::AutoDetect,
-                    Hostname("aws-eu-central-s1.eessi.science".to_string()),
+                    Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
                 ),
                 Server::new(
                     ServerType::SyncServer,
                     ServerBackendType::S3,
-                    Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
+                    Hostname::try_from("aws-eu-west-s1-sync.eessi.science").unwrap(),
                 ),
             ]);
 
@@ -350,7 +350,7 @@ mod tests {
             .with_servers(vec![Server::new(
                 ServerType::Stratum1,
                 ServerBackendType::AutoDetect,
-                Hostname("aws-eu-central-s1.eessi.science".to_string()),
+                Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
             )]);
 
         let results = scraper.validate().unwrap().scrape().await;

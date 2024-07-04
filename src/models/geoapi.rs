@@ -85,7 +85,7 @@ impl GeoapiServerQuery {
         if self.response.len() != self.geoapi_hosts.len() {
             return Err(ScrapeError::GeoAPIFailure(format!(
                 "GeoAPI response count mismatch for repository {}: expected {}, got {}",
-                self.hostname.0,
+                self.hostname,
                 self.geoapi_hosts.len(),
                 self.response.len()
             )));

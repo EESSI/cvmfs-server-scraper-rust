@@ -22,17 +22,17 @@ async fn main() -> Result<(), CVMFSScraperError> {
         Server::new(
             ServerType::Stratum1,
             ServerBackendType::CVMFS,
-            Hostname("azure-us-east-s1.eessi.science".to_string()),
+            Hostname::try_from("azure-us-east-s1.eessi.science")?,
         ),
         Server::new(
             ServerType::Stratum1,
             ServerBackendType::AutoDetect,
-            Hostname("aws-eu-central-s1.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-central-s1.eessi.science")?,
         ),
         Server::new(
             ServerType::SyncServer,
             ServerBackendType::S3,
-            Hostname("aws-eu-west-s1-sync.eessi.science".to_string()),
+            Hostname::try_from("aws-eu-west-s1-sync.eessi.science")?,
         ),
     ];
     let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
