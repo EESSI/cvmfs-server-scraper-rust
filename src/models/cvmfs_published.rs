@@ -122,7 +122,7 @@ impl std::str::FromStr for Manifest {
 }
 
 impl Manifest {
-    pub fn display(&self) {
+    pub fn output(&self) {
         println!("  Manifest for repository: {}", self.n);
         println!("    Root catalog hash: {}", self.c);
         println!("    Root catalog size: {}", self.b);

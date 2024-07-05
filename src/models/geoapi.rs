@@ -17,9 +17,9 @@ pub struct GeoapiServerQuery {
 }
 
 impl GeoapiServerQuery {
-    pub fn display(&self) {
+    pub fn output(&self) {
         println!(
-            "Geoapi Hosts: {} -> {:?}",
+            "  Hosts: {} -> {:?}",
             self.geoapi_hosts
                 .iter()
                 .enumerate()

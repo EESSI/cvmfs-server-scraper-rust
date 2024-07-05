@@ -146,7 +146,7 @@ impl Server {
         }
     }
 
-    pub fn as_failed_server(&self, error: CVMFSScraperError) -> FailedServer {
+    pub fn to_failed_server(&self, error: CVMFSScraperError) -> FailedServer {
         FailedServer {
             hostname: self.hostname.clone(),
             server_type: self.server_type,
@@ -219,12 +219,12 @@ impl Server {
                     debug!("Detected CVMFS backend for {}", self.hostname);
                     match self.validate_repo_json_and_server_type(&repo_json) {
                         Ok(_) => {}
-                        Err(error) => return ScrapedServer::Failed(self.as_failed_server(error)),
+                        Err(error) => return ScrapedServer::Failed(self.to_failed_server(error)),
                     }
                     metadata = match MetadataFromRepoJSON::try_from(repo_json.clone()) {
                         Ok(meta) => meta,
                         Err(error) => {
-                            return ScrapedServer::Failed(self.as_failed_server(error.into()))
+                            return ScrapedServer::Failed(self.to_failed_server(error.into()))
                         }
                     };
                     backend_detected = ServerBackendType::CVMFS;
@@ -241,7 +241,7 @@ impl Server {
                         debug!("Detected S3 backend for {}", self.hostname);
                         backend_detected = ServerBackendType::S3;
                     }
-                    _ => return ScrapedServer::Failed(self.as_failed_server(error.into())),
+                    _ => return ScrapedServer::Failed(self.to_failed_server(error.into())),
                 },
             },
             ServerBackendType::S3 => {
@@ -250,7 +250,7 @@ impl Server {
                         "Empty repository list with explicit S3 backend: {}",
                         self.hostname
                     );
-                    return ScrapedServer::Failed(self.as_failed_server(
+                    return ScrapedServer::Failed(self.to_failed_server(
                         ScrapeError::EmptyRepositoryList(self.hostname.to_string()).into(),
                     ));
                 }
@@ -259,19 +259,19 @@ impl Server {
                 let repo_json = match self.fetch_repos_json(&client).await {
                     Ok(repo_json) => repo_json,
                     Err(error) => {
-                        return ScrapedServer::Failed(self.as_failed_server(error.into()))
+                        return ScrapedServer::Failed(self.to_failed_server(error.into()))
                     }
                 };
                 metadata = match MetadataFromRepoJSON::try_from(repo_json.clone()) {
                     Ok(meta) => meta,
                     Err(error) => {
-                        return ScrapedServer::Failed(self.as_failed_server(error.into()))
+                        return ScrapedServer::Failed(self.to_failed_server(error.into()))
                     }
                 };
                 match self.validate_repo_json_and_server_type(&repo_json) {
                     Ok(_) => {}
                     Err(error) => {
-                        return ScrapedServer::Failed(self.as_failed_server(error));
+                        return ScrapedServer::Failed(self.to_failed_server(error));
                     }
                 }
                 all_repos.extend(
@@ -289,7 +289,7 @@ impl Server {
             let populated_repo = match repo.scrape(&client).await {
                 Ok(repo) => repo,
                 Err(error) => {
-                    return ScrapedServer::Failed(self.as_failed_server(error));
+                    return ScrapedServer::Failed(self.to_failed_server(error));
                 }
             };
             populated_repos.push(populated_repo);
@@ -313,7 +313,7 @@ impl Server {
             {
                 Ok(geoapi) => geoapi,
                 Err(error) => {
-                    return ScrapedServer::Failed(self.as_failed_server(error.into()));
+                    return ScrapedServer::Failed(self.to_failed_server(error.into()));
                 }
             }
         } else {
@@ -483,7 +483,7 @@ impl std::fmt::Display for PopulatedServer {
 }
 
 impl PopulatedServer {
-    pub fn display(&self) {
+    pub fn output(&self) {
         println!("Server: {}", self.hostname);
         println!("Type: {:?}", self.server_type);
         println!("Backend: {:?}", self.backend_type);
@@ -491,21 +491,21 @@ impl PopulatedServer {
             println!("Detected Backend: {:?}", self.backend_detected);
         }
         if self.backend_detected != ServerBackendType::S3 {
-            self.metadata.display();
+            self.metadata.output();
         } else {
             println!("Metadata: Not vailable for S3 servers.");
         }
-        println!("Repositories:");
-        for repo in &self.repositories {
-            println!("  {}", repo.name);
-            repo.display();
-        }
-
         if self.backend_detected != ServerBackendType::S3 {
             println!("GeoAPI:");
-            self.geoapi.display();
+            self.geoapi.output();
         } else {
             println!("GeoAPI: Not available for S3 servers.");
+        }
+
+        println!("Repositories:");
+        for repo in &self.repositories {
+            println!("\n Name: {}", repo.name);
+            repo.output();
         }
     }
 
@@ -604,7 +604,7 @@ impl ServerMetadata {
         self.os_id = repo_meta.os_id;
     }
 
-    pub fn display(&self) {
+    pub fn output(&self) {
         println!("Metadata:");
         if let Some(schema_version) = self.schema_version {
             println!("  Schema Version: {}", schema_version);
@@ -717,11 +717,10 @@ pub struct PopulatedRepositoryOrReplica {
 }
 
 impl PopulatedRepositoryOrReplica {
-    pub fn display(&self) {
-        println!(" Name: {}", self.name);
+    pub fn output(&self) {
         println!("  Last Snapshot: {}", self.last_snapshot);
         println!("  Last GC: {}", self.last_gc);
-        self.manifest.display();
+        self.manifest.output();
     }
     pub fn revision(&self) -> i32 {
         self.manifest.s

@@ -50,7 +50,7 @@ async fn main() -> Result<(), CVMFSScraperError> {
         match server {
             ScrapedServer::Populated(populated_server) => {
                println!("{}", populated_server);
-               populated_server.display();
+               populated_server.output();
                println!();
             }
             ScrapedServer::Failed(failed_server) => {
