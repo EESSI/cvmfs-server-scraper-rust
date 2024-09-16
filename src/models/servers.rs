@@ -301,7 +301,7 @@ impl Server {
         };
 
         let metadata = self.merge_metadata(metadata, meta_json);
-        let geoapi = if populated_repos.len() > 0 {
+        let geoapi = if populated_repos.len() > 0 && self.server_type != ServerType::Stratum0 {
             match self
                 .fetch_geoapi(
                     &client,

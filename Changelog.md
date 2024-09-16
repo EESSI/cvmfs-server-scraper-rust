@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this will adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 we reach version 0.1.0, up until then, expect breaking changes.
 
+## [0.0.4] - 2024-09-16
+
+### Fixed
+
+- Do not try to scrape GeoAPI information from stratum0.
+
 ## [0.0.3] - 2024-09-16
 
 ### Added
