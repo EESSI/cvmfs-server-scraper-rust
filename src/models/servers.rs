@@ -712,14 +712,18 @@ impl RepositoryOrReplica {
 pub struct PopulatedRepositoryOrReplica {
     pub name: String,
     pub manifest: Manifest,
-    pub last_snapshot: MaybeRfc2822DateTime,
-    pub last_gc: MaybeRfc2822DateTime,
+    pub last_snapshot: Option<MaybeRfc2822DateTime>,
+    pub last_gc: Option<MaybeRfc2822DateTime>,
 }
 
 impl PopulatedRepositoryOrReplica {
     pub fn output(&self) {
-        println!("  Last Snapshot: {}", self.last_snapshot);
-        println!("  Last GC: {}", self.last_gc);
+        if self.last_gc.is_some() {
+            println!("  Last Snapshot: {}", self.last_snapshot.as_ref().unwrap());
+        }
+        if self.last_gc.is_some() {
+            println!("  Last GC: {}", self.last_gc.as_ref().unwrap());
+        }
         self.manifest.output();
     }
     pub fn revision(&self) -> i32 {

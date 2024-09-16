@@ -4,9 +4,10 @@ use crate::models::generic::MaybeRfc2822DateTime;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct StatusJSON {
-    #[serde(default = "MaybeRfc2822DateTime::default")]
-    pub last_snapshot: MaybeRfc2822DateTime,
-    pub last_gc: MaybeRfc2822DateTime,
+    #[serde(default)]
+    pub last_snapshot: Option<MaybeRfc2822DateTime>,
+    #[serde(default)]
+    pub last_gc: Option<MaybeRfc2822DateTime>,
 }
 
 #[cfg(test)]
@@ -27,7 +28,7 @@ mod tests {
 
         // Wed, 18 Feb 2015 23:16:09 GMT
         assert_eq!(
-            status.last_snapshot.try_into_datetime().unwrap(),
+            status.last_snapshot.unwrap().try_into_datetime().unwrap(),
             Some(
                 Rfc2822DateTime::from("Fri, 21 Jun 2024 17:40:02 +0000")
                     .try_into()
@@ -35,9 +36,30 @@ mod tests {
             )
         );
         assert_eq!(
-            status.last_gc.try_into_datetime().unwrap(),
+            status.last_gc.unwrap().try_into_datetime().unwrap(),
             Some(
                 Rfc2822DateTime::from("Sun, 16 Jun 2024 00:00:59 +0000")
+                    .try_into()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn test_status_json_deserialization_missing_last_gc() {
+        let json_data = r#"
+        {
+            "last_snapshot": "Fri Jun 21 17:40:02 UTC 2024"
+        }
+        "#;
+
+        let status: StatusJSON = serde_json::from_str(json_data).unwrap();
+
+        // Wed, 18 Feb 2015 23:16:09 GMT
+        assert_eq!(
+            status.last_snapshot.unwrap().try_into_datetime().unwrap(),
+            Some(
+                Rfc2822DateTime::from("Fri, 21 Jun 2024 17:40:02 +0000")
                     .try_into()
                     .unwrap()
             )
