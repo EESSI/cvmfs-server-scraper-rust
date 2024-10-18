@@ -559,13 +559,28 @@ impl TryFrom<RepositoriesJSON> for MetadataFromRepoJSON {
     }
 }
 
+// Custom serializer function as semver::Version does not implement Serialize
+fn serialize_version_as_string<S>(
+    version: &Option<semver::Version>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::ser::Serializer,
+{
+    match version {
+        Some(v) => serializer.serialize_some(&v.to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Merged metadata about the server from the repositories.json and meta.json files.
 ///
 /// This struct contains metadata about the server. It is a combination of the metadata from the
 /// repositories.json file and the meta.json file.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ServerMetadata {
     pub schema_version: Option<u32>,
+    #[serde(serialize_with = "serialize_version_as_string")]
     pub cvmfs_version: Option<semver::Version>,
     pub last_geodb_update: MaybeRfc2822DateTime,
     pub os_version_id: Option<String>,
@@ -728,5 +743,78 @@ impl PopulatedRepositoryOrReplica {
     }
     pub fn revision(&self) -> i32 {
         self.manifest.s
+    }
+}
+#[cfg(test)]
+mod test {
+    use super::*;
+    use serde_json::{json, Value};
+    use yare::parameterized;
+
+    #[parameterized(
+        test_full_data = {
+            Some(1),
+            Some("2.8.4"),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some("rhel7"),
+            Some("Red Hat Enterprise Linux 7"),
+            Some("rhel"),
+            Some("admin"),
+            Some("admin@host.com"),
+            Some("host.com"),
+            None // custom field
+        },
+        test_minimal_data = {
+            None, None, None, None, None, None, None, None, None, None
+        },
+        test_custom_data = {
+            None, None, None, None, None, None, None, None, None, Some(json!({"key": "value"}))
+        }
+    )]
+    fn test_serialization_of_metadata(
+        schema_version: Option<u32>,
+        cvmfs_version: Option<&str>,
+        last_geodb_update: Option<&str>,
+        os_version_id: Option<&str>,
+        os_pretty_name: Option<&str>,
+        os_id: Option<&str>,
+        administrator: Option<&str>,
+        email: Option<&str>,
+        organisation: Option<&str>,
+        custom: Option<Value>,
+    ) {
+        // Construct the ServerMetadata instance
+        let metadata = ServerMetadata {
+            schema_version,
+            cvmfs_version: cvmfs_version.map(|v| semver::Version::parse(v).unwrap()),
+            last_geodb_update: MaybeRfc2822DateTime(last_geodb_update.map(|s| s.to_string())),
+            os_version_id: os_version_id.map(|s| s.to_string()),
+            os_pretty_name: os_pretty_name.map(|s| s.to_string()),
+            os_id: os_id.map(|s| s.to_string()),
+            administrator: administrator.map(|s| s.to_string()),
+            email: email.map(|s| s.to_string()),
+            organisation: organisation.map(|s| s.to_string()),
+            custom: custom.clone(),
+        };
+
+        // Build the expected JSON
+        let expected = json!({
+            "schema_version": schema_version,
+            "cvmfs_version": cvmfs_version,
+            "last_geodb_update": last_geodb_update,
+            "os_version_id": os_version_id,
+            "os_pretty_name": os_pretty_name,
+            "os_id": os_id,
+            "administrator": administrator,
+            "email": email,
+            "organisation": organisation,
+            "custom": custom.unwrap_or(Value::Null),
+        });
+
+        // Serialize the metadata to JSON
+        let json = serde_json::to_value(&metadata).unwrap();
+
+        // Compare the actual JSON with the expected JSON
+        assert_eq!(json, expected);
     }
 }

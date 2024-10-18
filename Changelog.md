@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this will adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 we reach version 0.1.0, up until then, expect breaking changes.
 
+## [0.0.5] - 2024-10-18
+
+### Added
+
+- ServerMetadata is now serializable.
+
 ## [0.0.4] - 2024-09-16
 
 ### Fixed
