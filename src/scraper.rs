@@ -29,6 +29,8 @@ pub struct ValidatedAndReady;
 /// - You may only validate the scraper in the WithServers state.
 /// - You may only scrape the servers in the ValidatedAndReady state.
 /// - Once the scraper is in the ValidatedAndReady state, it is no longer mutable.
+/// - If you use only_scrape_forced_repositories, only the repositories in the forced list will
+///   be scraped, meaning that ignored_repositories will have no effect.
 ///
 /// ### Example
 ///
@@ -53,6 +55,7 @@ pub struct ValidatedAndReady;
 ///     let scraper = Scraper::new()
 ///        .forced_repositories(vec!["repo1", "repo2"])
 ///        .with_servers(servers)
+///        .only_scrape_forced_repositories(false) // this is the default
 ///        .ignored_repositories(vec!["repo3", "repo4"])
 ///        .geoapi_servers(vec!["cvmfs-stratum-one.cern.ch", "cvmfs-stratum-one.ihep.ac.cn"])?;
 ///    
@@ -63,6 +66,7 @@ pub struct ValidatedAndReady;
 pub struct Scraper<State = WithoutServers> {
     servers: Option<Vec<Server>>,
     forced_repos: Vec<String>,
+    only_scrape_forced_repos: bool,
     ignored_repos: Vec<String>,
     geoapi_servers: Vec<Hostname>,
     _state: PhantomData<State>,
@@ -84,6 +88,7 @@ impl Scraper<WithoutServers> {
         Scraper {
             servers: None,
             forced_repos: Vec::new(),
+            only_scrape_forced_repos: false,
             ignored_repos: Vec::new(),
             geoapi_servers: DEFAULT_GEOAPI_SERVERS.clone(),
             _state: PhantomData,
@@ -98,6 +103,7 @@ impl Scraper<WithoutServers> {
         Scraper {
             servers: Some(servers),
             forced_repos: self.forced_repos,
+            only_scrape_forced_repos: self.only_scrape_forced_repos,
             ignored_repos: self.ignored_repos,
             geoapi_servers: self.geoapi_servers,
             _state: PhantomData,
@@ -116,6 +122,15 @@ pub trait ScraperCommon {
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
+        Self: Sized;
+
+    /// Set whether to only scrape forced repositories.
+    ///
+    /// If set to true, only the repositories specified in the forced_repositories() method will be scraped.
+    /// If set to false (default), all repositories found in repositories.json will be scraped, unless
+    /// they are in the ignored_repositories() list.
+    fn only_scrape_forced_repositories(self, only: bool) -> Self
+    where
         Self: Sized;
 
     /// Add a list of ignored repositories to the scraper.
@@ -183,11 +198,24 @@ impl ScraperCommon for Scraper<WithoutServers> {
         self
     }
 
+    fn only_scrape_forced_repositories(mut self, only: bool) -> Self {
+        if only && !self.ignored_repos.is_empty() {
+            info!("Setting only_scrape_forced_repositories to true will ignore a non-empty ignored_repositories list.");
+        }
+
+        self.only_scrape_forced_repos = only;
+        self
+    }
+
     fn ignored_repositories<I, S>(mut self, repos: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        if self.only_scrape_forced_repos {
+            info!("Setting ignored_repositories will have no effect when only_scrape_forced_repositories is set to true.");
+        }
+
         self.ignored_repos = repos.into_iter().map(Into::into).collect();
         self
     }
@@ -217,11 +245,24 @@ impl ScraperCommon for Scraper<WithServers> {
         self
     }
 
+    fn only_scrape_forced_repositories(mut self, only: bool) -> Self {
+        if only && !self.ignored_repos.is_empty() {
+            info!("Setting only_scrape_forced_repositories to true will ignore a non-empty ignored_repositories list.");
+        }
+
+        self.only_scrape_forced_repos = only;
+        self
+    }
+
     fn ignored_repositories<I, S>(mut self, repos: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        if self.only_scrape_forced_repos {
+            info!("Setting ignored_repositories will have no effect when only_scrape_forced_repositories is set to true.");
+        }
+
         self.ignored_repos = repos.into_iter().map(Into::into).collect();
         self
     }
@@ -267,6 +308,7 @@ impl Scraper<WithServers> {
         Ok(Scraper {
             servers: self.servers,
             forced_repos: self.forced_repos,
+            only_scrape_forced_repos: self.only_scrape_forced_repos,
             ignored_repos: self.ignored_repos,
             geoapi_servers: self.geoapi_servers,
             _state: PhantomData,
@@ -288,6 +330,7 @@ impl Scraper<ValidatedAndReady> {
             servers.clone(),
             self.forced_repos.clone(),
             self.ignored_repos.clone(),
+            self.only_scrape_forced_repos,
             self.geoapi_servers.clone(),
         )
         .await
@@ -301,6 +344,7 @@ async fn scrape_servers<R>(
     servers: Vec<Server>,
     scrape_repos: Vec<R>,
     ignored_repos: Vec<R>,
+    only_scrape_forced_repos: bool,
     geoapi_hosts: Vec<Hostname>,
 ) -> Vec<ScrapedServer>
 where
@@ -316,10 +360,11 @@ where
     let start = Instant::now();
     let scrapes_attempted = servers.len();
     trace!(
-        "Start of scraping run. Servers: {:?}, repositories: {:?} (ignored: {:?}), geoapi_servers: {:?}",
+        "Start of scraping run. Servers: {:?}, repositories: {:?} (ignored: {:?}, forced_only: {:?}), geoapi_servers: {:?}",
         servers,
         scrape_repos,
         ignored_repos,
+        only_scrape_forced_repos,
         geoapi_servers
     );
     let futures = servers.iter().map(|server| {
@@ -331,6 +376,7 @@ where
                 .scrape(
                     repolist.clone(),
                     ignore.clone(),
+                    only_scrape_forced_repos,
                     Some(geoapi_servers.clone()),
                 )
                 .await
@@ -376,7 +422,7 @@ mod tests {
     use crate::models::{Hostname, Server, ServerBackendType, ServerType};
 
     #[tokio::test]
-    async fn test_online_cvmfs_servers_using_scan_servers() {
+    async fn test_online_cvmfs_servers_using_scrape_servers() {
         let servers = vec![
             Server::new(
                 ServerType::Stratum1,
@@ -396,7 +442,7 @@ mod tests {
         ];
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-        let results = scrape_servers(servers, repolist.clone(), vec![], vec![]).await;
+        let results = scrape_servers(servers, repolist.clone(), vec![], false, vec![]).await;
 
         for result in results {
             match result {

@@ -161,16 +161,22 @@ impl Server {
     /// also fetch metadata about the server from the repositories.json and meta.json files, if they
     /// are available.
     ///
-    /// The method takes a list of repositories to scrape (which may be empty unless the backend is S3)
-    /// and a list of repositories to ignore (this may be empty). It also takes an optional list of
-    /// geoapi servers to use when fetching geoapi information.
+    /// ## Arguments
     ///
-    /// The method will return a populated server object if the scrape is successful, or a failed server
-    /// object if the scrape fails.
+    /// - `repositories`: A list of repositories to scrape. This may be empty unless the backend is S3.
+    /// - `ignored_repositories`: A list of repositories to ignore. This may be empty.
+    /// - `only_scrape_forced_repos`: If true, only the repositories provided in the `repositories` argument will be scraped
+    ///    which overrides ignored_repositories. If false, the repositories from repositories.json will be merged with
+    ///    the provided list and then filtered by ignored_repositories.
+    ///
+    /// ## Returns
+    ///
+    /// A ScrapedServer enum containing either a PopulatedServer or a FailedServer.
     pub async fn scrape<R>(
         &self,
         repositories: Vec<R>,
         ignored_repositories: Vec<R>,
+        only_scrape_forced_repos: bool,
         geoapi_servers: Option<Vec<Hostname>>,
     ) -> ScrapedServer
     where
@@ -228,13 +234,16 @@ impl Server {
                         }
                     };
                     backend_detected = ServerBackendType::CVMFS;
-                    all_repos.extend(
-                        repo_json
-                            .repositories_and_replicas()
-                            .into_iter()
-                            .filter(|r| !ignore.contains(&r.name))
-                            .map(|r| r.name),
-                    );
+
+                    if !only_scrape_forced_repos {
+                        all_repos.extend(
+                            repo_json
+                                .repositories_and_replicas()
+                                .into_iter()
+                                .filter(|r| !ignore.contains(&r.name))
+                                .map(|r| r.name),
+                        );
+                    };
                 }
                 Err(error) => match error {
                     ScrapeError::FetchError(_) => {
@@ -274,13 +283,15 @@ impl Server {
                         return ScrapedServer::Failed(self.to_failed_server(error));
                     }
                 }
-                all_repos.extend(
-                    repo_json
-                        .repositories_and_replicas()
-                        .into_iter()
-                        .filter(|r| !ignore.contains(&r.name))
-                        .map(|r| r.name),
-                );
+                if !only_scrape_forced_repos {
+                    all_repos.extend(
+                        repo_json
+                            .repositories_and_replicas()
+                            .into_iter()
+                            .filter(|r| !ignore.contains(&r.name))
+                            .map(|r| r.name),
+                    )
+                };
             }
         }
 

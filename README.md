@@ -42,6 +42,7 @@ async fn main() -> Result<(), CVMFSScraperError> {
     let scraped_servers = Scraper::new()
        .forced_repositories(repolist)
        .ignored_repositories(ignored_repos)
+       .only_scrape_forced_repositories(false) // Only scrape forced repositories if true, overrides ignored_repositories
        .geoapi_servers(DEFAULT_GEOAPI_SERVERS.clone())? // This is the default list
        .with_servers(servers) // Transitions to a WithServer state.
        .validate()? // Transitions to a ValidatedAndReady state, now immutable.
@@ -73,6 +74,8 @@ There are three valid options for backends for a given server. These are:
 For populated servers, the field `backend_detected` will be set to the detected backend, which for explicit S3 or CVMFS servers will be the same as requested type.
 
 ## What repositories are scraped?
+
+If `only_scrape_forced_repositories` is set to true, only the repositories explicitly passed to the scraper will be scraped, ignoring any ignored repositories. Otherwise, the following rules apply:
 
 - For servers that are set to or detected as CVMFS, the scraper will scrape the union of the detected and configurations explicitly stated repositories.
 - For servers that are set to or detected as S3, only the explicitly stated repositories will be scraped (and the scraper will fail if the server type is explicitly set to S3 and no repositories are passed).

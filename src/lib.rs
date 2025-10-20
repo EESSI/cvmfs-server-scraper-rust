@@ -49,6 +49,7 @@
 //!    let scraped_servers = Scraper::new()
 //!       .forced_repositories(repolist)
 //!       .ignored_repositories(ignored_repos)
+//!       .only_scrape_forced_repositories(false) // Only scrape forced repositories if true, overrides ignored_repositories, default false
 //!       .geoapi_servers(DEFAULT_GEOAPI_SERVERS.clone())? // This is the default list
 //!       .with_servers(servers) // Transitions to a WithServer state.
 //!       .validate()? // Transitions to a ValidatedAndReady state, now immutable.
@@ -117,7 +118,7 @@ mod tests {
         let futures = servers.into_iter().map(|server| {
             let repolist = repolist.clone();
             async move {
-                match server.scrape(repolist.clone(), vec![], None).await {
+                match server.scrape(repolist.clone(), vec![], false, None).await {
                     ScrapedServer::Populated(popserver) => {
                         for repo in repolist {
                             assert!(popserver.has_repository(repo));
@@ -143,7 +144,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io"];
 
-        match server.scrape(repolist.clone(), vec![], None).await {
+        match server.scrape(repolist.clone(), vec![], false, None).await {
             ScrapedServer::Populated(_) => {
                 panic!("Error, should not have succeeded");
             }
@@ -163,7 +164,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let repoparams: Vec<String> = Vec::new();
-        let servers = server.scrape(repoparams, vec![], None).await;
+        let servers = server.scrape(repoparams, vec![], false, None).await;
         for repo in repolist {
             match servers.clone() {
                 ScrapedServer::Populated(popserver) => {
@@ -186,7 +187,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let popserver = server
-            .scrape(repolist.clone(), vec![], None)
+            .scrape(repolist.clone(), vec![], false, None)
             .await
             .get_populated_server()
             .unwrap();
@@ -203,7 +204,7 @@ mod tests {
         );
 
         let repoparams: Vec<String> = Vec::new();
-        let popserver = server.scrape(repoparams, vec![], None).await;
+        let popserver = server.scrape(repoparams, vec![], false, None).await;
         assert!(popserver.is_ok());
         let popserver = popserver.get_populated_server().unwrap();
         assert_eq!(popserver.backend_type, ServerBackendType::AutoDetect);
@@ -220,7 +221,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let popserver = server
-            .scrape(repolist.clone(), vec![], None)
+            .scrape(repolist.clone(), vec![], false, None)
             .await
             .get_populated_server()
             .unwrap();
@@ -238,7 +239,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let popserver = server
-            .scrape(repolist.clone(), vec![], None)
+            .scrape(repolist.clone(), vec![], false, None)
             .await
             .get_populated_server()
             .unwrap();
@@ -269,7 +270,7 @@ mod tests {
 
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let popserver = server
-            .scrape(repolist.clone(), vec![], None)
+            .scrape(repolist.clone(), vec![], false, None)
             .await
             .get_populated_server()
             .unwrap();
@@ -292,13 +293,33 @@ mod tests {
         let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
         let ignored_repos = vec!["riscv.eessi.io"];
         let popserver = server
-            .scrape(repolist.clone(), ignored_repos.clone(), None)
+            .scrape(repolist.clone(), ignored_repos.clone(), false, None)
             .await
             .get_populated_server()
             .unwrap();
         assert!(popserver.has_repository("software.eessi.io"));
         assert!(popserver.has_repository("dev.eessi.io"));
         assert!(!popserver.has_repository("riscv.eessi.io"));
+    }
+
+    #[tokio::test]
+    async fn test_online_cvmfs_server_s1_only_forced_repos() {
+        let server = Server::new(
+            ServerType::Stratum1,
+            ServerBackendType::CVMFS,
+            Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
+        );
+
+        let repolist = vec!["software.eessi.io", "dev.eessi.io"];
+        let popserver = server
+            .scrape(repolist.clone(), vec![], true, None)
+            .await
+            .get_populated_server()
+            .unwrap();
+        assert!(popserver.has_repository("software.eessi.io"));
+        assert!(popserver.has_repository("dev.eessi.io"));
+
+        assert!(popserver.repositories.len() == 2);
     }
 
     #[tokio::test]

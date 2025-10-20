@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this will adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 we reach version 0.1.0, up until then, expect breaking changes.
 
+## [0.0.6] - 2025-10-20
+
+### Added
+
+- `scrape` for a server now takes a boolean argument to indicate if only the explicitly listed repositories for that server are to be scraped, overriding `ignored_repositories`.
+  This parameter is also added to the `scrape_servers` API, in both cases requiring consumers to update their code accordingly. To retain previous behavior, pass `false` to
+  either function. If using the builder interface, `only_scrape_forced_repositories(true|false)` is available. The default is `false`, retaining previous behavior and requiring no changes.
+
 ## [0.0.5] - 2024-10-18
 
 ### Added
