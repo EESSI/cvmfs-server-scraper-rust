@@ -1,6 +1,6 @@
 use log::trace;
 use rand::distr::Alphanumeric;
-use rand::{rng, Rng};
+use rand::{rng, RngExt};
 use reqwest::Client;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;

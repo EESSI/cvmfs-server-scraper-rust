@@ -101,7 +101,7 @@ pub struct FailedServer {
 
 #[derive(Debug, Clone)]
 pub enum ScrapedServer {
-    Populated(PopulatedServer),
+    Populated(Box<PopulatedServer>),
     Failed(FailedServer),
 }
 
@@ -109,19 +109,40 @@ impl ScrapedServer {
     pub fn is_failed(&self) -> bool {
         matches!(self, ScrapedServer::Failed(_))
     }
-    pub fn is_ok(&self) -> bool {
+
+    pub fn is_populated(&self) -> bool {
         matches!(self, ScrapedServer::Populated(_))
     }
-    pub fn get_populated_server(self) -> Result<PopulatedServer, GenericError> {
+
+    pub fn is_ok(&self) -> bool {
+        self.is_populated()
+    }
+
+    pub fn as_populated_server(&self) -> Option<&PopulatedServer> {
         match self {
-            ScrapedServer::Populated(server) => Ok(server),
+            ScrapedServer::Populated(server) => Some(server.as_ref()),
+            ScrapedServer::Failed(_) => None,
+        }
+    }
+
+    pub fn as_failed_server(&self) -> Option<&FailedServer> {
+        match self {
+            ScrapedServer::Failed(server) => Some(server),
+            ScrapedServer::Populated(_) => None,
+        }
+    }
+
+    pub fn into_populated_server(self) -> Result<PopulatedServer, GenericError> {
+        match self {
+            ScrapedServer::Populated(server) => Ok(*server),
             ScrapedServer::Failed(failed) => Err(GenericError::TypeError(format!(
                 "{} is a failed server",
                 failed.hostname
             ))),
         }
     }
-    pub fn get_failed_server(self) -> Result<FailedServer, GenericError> {
+
+    pub fn into_failed_server(self) -> Result<FailedServer, GenericError> {
         match self {
             ScrapedServer::Failed(failed) => Ok(failed),
             ScrapedServer::Populated(server) => Err(GenericError::TypeError(format!(
@@ -129,6 +150,14 @@ impl ScrapedServer {
                 server.hostname
             ))),
         }
+    }
+
+    pub fn get_populated_server(self) -> Result<PopulatedServer, GenericError> {
+        self.into_populated_server()
+    }
+
+    pub fn get_failed_server(self) -> Result<FailedServer, GenericError> {
+        self.into_failed_server()
     }
 }
 
@@ -166,8 +195,8 @@ impl Server {
     /// - `repositories`: A list of repositories to scrape. This may be empty unless the backend is S3.
     /// - `ignored_repositories`: A list of repositories to ignore. This may be empty.
     /// - `only_scrape_forced_repos`: If true, only the repositories provided in the `repositories` argument will be scraped
-    ///    which overrides ignored_repositories. If false, the repositories from repositories.json will be merged with
-    ///    the provided list and then filtered by ignored_repositories.
+    ///   which overrides ignored_repositories. If false, the repositories from repositories.json will be merged with
+    ///   the provided list and then filtered by ignored_repositories.
     ///
     /// ## Returns
     ///
@@ -306,13 +335,10 @@ impl Server {
             populated_repos.push(populated_repo);
         }
 
-        let meta_json: Option<MetaJSON> = match self.fetch_meta_json(&client).await {
-            Ok(meta) => Some(meta),
-            Err(_) => None,
-        };
+        let meta_json: Option<MetaJSON> = self.fetch_meta_json(&client).await.ok();
 
         let metadata = self.merge_metadata(metadata, meta_json);
-        let geoapi = if populated_repos.len() > 0 && self.server_type != ServerType::Stratum0 {
+        let geoapi = if !populated_repos.is_empty() && self.server_type != ServerType::Stratum0 {
             match self
                 .fetch_geoapi(
                     &client,
@@ -335,7 +361,7 @@ impl Server {
             }
         };
 
-        ScrapedServer::Populated(PopulatedServer {
+        ScrapedServer::Populated(Box::new(PopulatedServer {
             server_type: self.server_type,
             backend_type: self.backend_type,
             backend_detected,
@@ -343,7 +369,7 @@ impl Server {
             repositories: populated_repos,
             metadata,
             geoapi,
-        })
+        }))
     }
 
     async fn fetch_repos_json(
@@ -744,11 +770,11 @@ pub struct PopulatedRepositoryOrReplica {
 
 impl PopulatedRepositoryOrReplica {
     pub fn output(&self) {
-        if self.last_gc.is_some() {
-            println!("  Last Snapshot: {}", self.last_snapshot.as_ref().unwrap());
+        if let Some(last_snapshot) = &self.last_snapshot {
+            println!("  Last Snapshot: {}", last_snapshot);
         }
-        if self.last_gc.is_some() {
-            println!("  Last GC: {}", self.last_gc.as_ref().unwrap());
+        if let Some(last_gc) = &self.last_gc {
+            println!("  Last GC: {}", last_gc);
         }
         self.manifest.output();
     }
@@ -761,6 +787,119 @@ mod test {
     use super::*;
     use serde_json::{json, Value};
     use yare::parameterized;
+
+    fn test_hostname() -> Hostname {
+        Hostname::try_from("example.com").unwrap()
+    }
+
+    fn test_geoapi() -> GeoapiServerQuery {
+        GeoapiServerQuery {
+            hostname: test_hostname(),
+            geoapi_hosts: Vec::new(),
+            response: Vec::new(),
+        }
+    }
+
+    fn test_metadata() -> ServerMetadata {
+        ServerMetadata {
+            schema_version: None,
+            cvmfs_version: None,
+            last_geodb_update: MaybeRfc2822DateTime(None),
+            os_version_id: None,
+            os_pretty_name: None,
+            os_id: None,
+            administrator: None,
+            email: None,
+            organisation: None,
+            custom: None,
+        }
+    }
+
+    fn test_populated_server() -> PopulatedServer {
+        PopulatedServer {
+            server_type: ServerType::Stratum1,
+            backend_type: ServerBackendType::CVMFS,
+            backend_detected: ServerBackendType::CVMFS,
+            hostname: test_hostname(),
+            repositories: Vec::new(),
+            metadata: test_metadata(),
+            geoapi: test_geoapi(),
+        }
+    }
+
+    fn test_failed_server() -> FailedServer {
+        FailedServer {
+            hostname: test_hostname(),
+            server_type: ServerType::Stratum1,
+            backend_type: ServerBackendType::CVMFS,
+            error: CVMFSScraperError::GenericError(GenericError::TypeError("boom".to_string())),
+        }
+    }
+
+    #[test]
+    fn scraped_server_populated_accessors() {
+        let server = ScrapedServer::Populated(Box::new(test_populated_server()));
+
+        assert!(server.is_populated());
+        assert!(server.is_ok());
+        assert!(!server.is_failed());
+        assert_eq!(
+            server.as_populated_server().unwrap().hostname.to_str(),
+            "example.com"
+        );
+        assert!(server.as_failed_server().is_none());
+    }
+
+    #[test]
+    fn scraped_server_failed_accessors() {
+        let server = ScrapedServer::Failed(test_failed_server());
+
+        assert!(server.is_failed());
+        assert!(!server.is_populated());
+        assert!(!server.is_ok());
+        assert_eq!(
+            server.as_failed_server().unwrap().hostname.to_str(),
+            "example.com"
+        );
+        assert!(server.as_populated_server().is_none());
+    }
+
+    #[test]
+    fn scraped_server_into_populated_server_unboxes_value() {
+        let server = ScrapedServer::Populated(Box::new(test_populated_server()));
+
+        let populated = server.into_populated_server().unwrap();
+
+        assert_eq!(populated.hostname.to_str(), "example.com");
+    }
+
+    #[test]
+    fn scraped_server_into_failed_server_returns_value() {
+        let server = ScrapedServer::Failed(test_failed_server());
+
+        let failed = server.into_failed_server().unwrap();
+
+        assert_eq!(failed.hostname.to_str(), "example.com");
+    }
+
+    #[test]
+    fn scraped_server_into_accessors_reject_wrong_variant() {
+        let populated_error = ScrapedServer::Failed(test_failed_server())
+            .into_populated_server()
+            .unwrap_err();
+        let failed_error = ScrapedServer::Populated(Box::new(test_populated_server()))
+            .into_failed_server()
+            .unwrap_err();
+
+        assert_eq!(
+            populated_error.to_string(),
+            "Type error: example.com is a failed server"
+        );
+        assert_eq!(
+            failed_error.to_string(),
+            "Type error: example.com is a populated server"
+        );
+    }
 
     #[parameterized(
         test_full_data = {
@@ -808,6 +947,11 @@ mod test {
             custom: custom.clone(),
         };
 
+        let expected_custom = match &custom {
+            Some(value) => value.clone(),
+            None => Value::Null,
+        };
+
         // Build the expected JSON
         let expected = json!({
             "schema_version": schema_version,
@@ -819,7 +963,7 @@ mod test {
             "administrator": administrator,
             "email": email,
             "organisation": organisation,
-            "custom": custom.unwrap_or(Value::Null),
+            "custom": expected_custom,
         });
 
         // Serialize the metadata to JSON

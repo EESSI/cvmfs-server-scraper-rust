@@ -89,7 +89,6 @@ pub use scraper::{Scraper, ScraperCommon};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio;
 
     use futures::future::join_all;
 
@@ -205,8 +204,8 @@ mod tests {
 
         let repoparams: Vec<String> = Vec::new();
         let popserver = server.scrape(repoparams, vec![], false, None).await;
-        assert!(popserver.is_ok());
-        let popserver = popserver.get_populated_server().unwrap();
+        assert!(popserver.is_populated());
+        let popserver = popserver.as_populated_server().unwrap();
         assert_eq!(popserver.backend_type, ServerBackendType::AutoDetect);
         assert_eq!(popserver.backend_detected, ServerBackendType::CVMFS);
     }
@@ -351,7 +350,7 @@ mod tests {
         for result in results {
             match result {
                 ScrapedServer::Populated(popserver) => {
-                    for repo in vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"] {
+                    for repo in ["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"] {
                         assert!(popserver.has_repository(repo));
                     }
                 }

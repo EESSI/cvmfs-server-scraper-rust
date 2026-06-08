@@ -47,16 +47,13 @@ async fn main() -> Result<(), CVMFSScraperError> {
        .with_servers(servers) // Transitions to a WithServer state.
        .validate()? // Transitions to a ValidatedAndReady state, now immutable.
        .scrape().await; // Perform the scrape, return servers.
-    for server in scraped_servers {
-        match server {
-            ScrapedServer::Populated(populated_server) => {
+    for server in &scraped_servers {
+        if let Some(populated_server) = server.as_populated_server() {
                println!("{}", populated_server);
                populated_server.output();
                println!();
-            }
-            ScrapedServer::Failed(failed_server) => {
+        } else if let Some(failed_server) = server.as_failed_server() {
                panic!("Error! {} failed scraping: {:?}", failed_server.hostname, failed_server.error);
-            }
         }
     }
     Ok(())
