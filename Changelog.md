@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this will adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 we reach version 0.1.0, up until then, expect breaking changes.
 
+## [0.0.7] - 2026-06-08
+
+### Changed
+
+- Updated dependencies, including moving to the current `reqwest` 0.13 and `rand` 0.10 lines.
+- Set the minimum supported Rust version to 1.85.
+- `ScrapedServer::Populated` now stores `PopulatedServer` behind a `Box` to reduce enum size. Consumers that directly pattern match on this variant may need to dereference or unbox the value.
+- Added `ScrapedServer` helper methods: `is_populated`, `as_populated_server`, `as_failed_server`, `into_populated_server`, and `into_failed_server`.
+- Removed the inherent `Hostname::to_string` method; use the standard `ToString` implementation from `Display` instead.
+
 ## [0.0.6] - 2025-10-20
 
 ### Added

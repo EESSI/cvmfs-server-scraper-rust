@@ -113,14 +113,14 @@ mod tests {
     }
 
     #[parameterized(
-        failing_120 = { vec![1,2,0] },        
+        failing_120 = { vec![1,2,0] },
         failing_102 = { vec![1,0,2] },
         failing_021 = { vec![0,2,1] },
         failing_201 = { vec![2,0,1] },
         failing_210 = { vec![2,1,0] },
         failing_empty_response = { vec![] },
         failing_not_enough_response = { vec![0,1] },
-        failing_too_many_responses = { vec![0,1,2,3] } 
+        failing_too_many_responses = { vec![0,1,2,3] }
     )]
     fn test_check_against_expected_order_by_id_failure(res: Vec<u32>) {
         let geoapi = create_geoapi_server_query();
@@ -170,11 +170,12 @@ mod tests {
             "cvmfs-s1fnal.opensciencegrid.org".parse().unwrap(),
             "cvmfs-stratum-one.cern.ch".parse().unwrap(),
             "cvmfs-stratum-one.ihep.ac.cn".parse().unwrap(),
-            "cvmfs-stratum-one.ihep.ac.cn".parse().unwrap(), 
+            "cvmfs-stratum-one.ihep.ac.cn".parse().unwrap(),
         ]})]
-        fn test_check_against_expected_order_by_hostname_failure(res: Vec<Hostname>) {
-            let geoapi = create_geoapi_server_query();
-            assert!(!geoapi.check_against_expected_order_by_hostname(res).unwrap());
-        }
-    
+    fn test_check_against_expected_order_by_hostname_failure(res: Vec<Hostname>) {
+        let geoapi = create_geoapi_server_query();
+        assert!(!geoapi
+            .check_against_expected_order_by_hostname(res)
+            .unwrap());
+    }
 }

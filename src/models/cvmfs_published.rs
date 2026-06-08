@@ -23,8 +23,8 @@ use crate::utilities::{parse_boolean_field, parse_hex_field, parse_number_field}
 /// - y: Cryptographic hash of the reflog checksum
 /// - l: currently unused (reserved for micro catalogs)
 /// - signature: In order to provide authoritative information about a repository publisher, the
-///              repository manifest is signed by an X.509 certificate together with its private key.
-///              This field is not validated by this library.
+///   repository manifest is signed by an X.509 certificate together with its private key.
+///   This field is not validated by this library.
 ///
 /// Note that the field names are lowercase, but the field names in the manifest itself are uppercase.
 ///
