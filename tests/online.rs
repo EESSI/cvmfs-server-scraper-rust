@@ -267,6 +267,63 @@ async fn online_mixed_backends_preserve_configuration_order() {
 }
 
 #[tokio::test]
+#[ignore = "contacts public EESSI CVMFS and S3 servers; enable with the online-tests PR label"]
+async fn online_validated_scraper_can_be_reused_across_cycles() {
+    let expected_names = names(&["dev.eessi.io", "software.eessi.io"]);
+    let targets = [
+        (
+            server(
+                AWS_STRATUM1,
+                ServerType::Stratum1,
+                ServerBackendType::AutoDetect,
+            ),
+            BackendResolution::DiscoveredCvmfs,
+        ),
+        (
+            server(S3_SYNC, ServerType::SyncServer, ServerBackendType::S3),
+            BackendResolution::ConfiguredS3,
+        ),
+    ];
+    let options = options(RepositorySelection::only(expected_names.clone()))
+        .with_geoapi(GeoapiProbe::Disabled);
+    // A single shared permit forces queued requests to make progress in both runs.
+    let limits = options
+        .limits()
+        .clone()
+        .with_requests(ConcurrencyLimit::new(1).unwrap());
+    let scraper = Scraper::new()
+        .options(options.with_limits(limits))
+        .with_servers(targets.iter().map(|(server, _)| server.clone()).collect())
+        .validate()
+        .unwrap();
+
+    for cycle in 1..=2 {
+        let results = scraper.scrape().await;
+        assert_eq!(results.len(), targets.len(), "cycle {cycle}");
+        for (result, (server, backend)) in results.into_iter().zip(&targets) {
+            let result = populated(result);
+            assert_eq!(result.server(), server, "cycle {cycle}: server order");
+            assert_eq!(result.backend(), *backend, "cycle {cycle}: backend");
+            assert!(
+                result
+                    .repositories()
+                    .iter()
+                    .map(|repository| repository.name())
+                    .eq(expected_names.iter()),
+                "cycle {cycle}: repository selection/order for {}",
+                server.endpoint()
+            );
+            assert!(matches!(
+                result.geoapi(),
+                GeoapiOutcome::Skipped(GeoapiSkipReason::Disabled)
+            ));
+            // Each cycle must be valid independently: revisions and timestamps may change.
+            assert_repository_data(&result, &expected_names);
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore = "contacts a public EESSI Stratum1 server; enable with the online-tests PR label"]
 async fn online_stratum1_cannot_be_claimed_as_stratum0() {
     let server = server(AWS_STRATUM1, ServerType::Stratum0, ServerBackendType::CVMFS);

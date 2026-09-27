@@ -8,7 +8,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The suite uses `rstest` named `#[case::name(...)]` cases for input matrices and Tokio for async tests. `rstest` is a development dependency with its optional features disabled; the tests do not need its timeout runtime or crate-renaming support. HTTP fixtures bind ephemeral loopback ports and do not contact production servers. The nine public-server checks remain opt-in.
+The suite uses `rstest` named `#[case::name(...)]` cases for input matrices and Tokio for async tests. `rstest` is a development dependency with its optional features disabled; the tests do not need its timeout runtime or crate-renaming support. HTTP fixtures bind ephemeral loopback ports and do not contact production servers. The ten public-server checks remain opt-in.
 
 ## Online EESSI checks
 
@@ -28,11 +28,12 @@ The named cases cover the public deployments already used in the crate examples:
 | Repository selection | Exact `dev.eessi.io` / `software.eessi.io` selection, discovery with `riscv.eessi.io` excluded, and a custom GeoAPI host list. |
 | AWS EU West S3 sync | Explicit S3 and HTTP-404-based autodetection, all three repositories, absent index metadata, and unsupported GeoAPI. |
 | Mixed backends | The builder scrapes all three servers, retains configuration order, and honors disabled GeoAPI. |
+| Repeated scraping | One validated scraper runs two cycles against AWS Stratum1 and S3, preserving backend, selection, and result order with a single shared request permit. Each cycle is validated independently, allowing revisions and timestamps to change. |
 | Role mismatch | Claiming the AWS Stratum1 as Stratum0 fails with a role error. |
 
 Successful repository results are checked for name binding, published revisions, signature presence, publication timestamp conversion, and serialization of real manifest/status data. These are deployment checks: they do not assert fixed revision numbers, dates, CVMFS/OS versions, or GeoAPI distance order. Optional snapshot/GC fields remain optional, and signature presence does not establish authenticity.
 
-Tests run serially with at most four in-flight HTTP requests per scraper, a 100-repository limit, and a 60-second deadline per admitted server. The CI job has a 15-minute limit. Outages, access restrictions, changed deployment metadata, and malformed responses fail visibly; there are no automatic retries or silent skips. Online results are excluded from the deterministic coverage baseline. The nine checks passed locally on 2026-09-28.
+Tests run serially with at most four in-flight HTTP requests per scraper, a 100-repository limit, and a 60-second deadline per admitted server. The CI job has a 15-minute limit. Outages, access restrictions, changed deployment metadata, and malformed responses fail visibly; there are no automatic retries or silent skips. Online results are excluded from the deterministic coverage baseline.
 
 ## Reproduce coverage
 

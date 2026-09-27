@@ -142,7 +142,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Default tests use local loopback fixtures and require permission to bind `127.0.0.1`. They do not contact production servers. Add the `online-tests` label to a PR to enable the separate online CI workflow, or run `cargo test --locked --test online -- --ignored --test-threads=1` locally. The nine online cases exercise the public EESSI Stratum1 and S3 deployments. Rust 1.88 is the minimum supported version; CI checks it and stable.
+Default tests use local loopback fixtures and require permission to bind `127.0.0.1`. They do not contact production servers. Add the `online-tests` label to a PR to enable the separate online CI workflow, or run `cargo test --locked --test online -- --ignored --test-threads=1` locally. The ten online cases exercise the public EESSI Stratum1 and S3 deployments. Rust 1.88 is the minimum supported version; CI checks it and stable.
 
 Parameterized tests use `rstest` with named `#[case::name(...)]` cases. See [testing and coverage](docs/testing.md) for coverage commands, the measured baseline, remaining gaps, and CI reports.
 
