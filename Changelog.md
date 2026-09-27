@@ -26,6 +26,8 @@ we reach version 0.1.0, up until then, expect breaking changes.
 
 ### Changed
 
+- Restored crate and API documentation for the validated types, including manifest fields, builder transitions, server roles, and optional metadata semantics.
+- Added an `online-tests` PR label to enable public EESSI checks covering discovery, metadata, repository selection, GeoAPI, S3 backends, and mixed-server scraping.
 - Replaced `yare` with `rstest` named cases, expanded domain and loopback regression coverage, and added downloadable CI coverage reports.
 - Updated all Rust dependencies to their latest compatible releases.
 - Raised the minimum supported Rust version to 1.88 for the updated dependencies.
