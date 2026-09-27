@@ -1,460 +1,295 @@
-use log::{debug, info, trace, warn};
-use std::convert::TryFrom;
-use std::{fmt::Debug, time::Instant};
+use crate::transport::ScrapeClient;
+use crate::{
+    ConfigurationError, Hostname, RedirectPolicy, RepositoryName, ScrapeError, ScrapeLimits,
+    ScrapedServer, Server, ServerBackendType, DEFAULT_GEOAPI_SERVERS,
+};
+use futures::{stream, StreamExt};
+use std::collections::BTreeSet;
 
-use futures::future::join_all;
-use std::marker::PhantomData;
-
-use crate::constants::DEFAULT_GEOAPI_SERVERS;
-use crate::errors::{HostnameError, ScrapeError};
-use crate::models::{Hostname, ScrapedServer, Server, ServerBackendType};
-
-pub struct WithoutServers;
-pub struct WithServers;
-pub struct ValidatedAndReady;
-
-/// A scraper for CVMFS servers.
-///
-/// This struct provides a builder interface for scraping CVMFS servers, and it has three
-/// states: WithoutServers, WithServers, and ValidatedAndReady. The scraper is created
-/// with the new() method, and then servers can be added with the with_servers() method.
-///
-/// Transitions:
-/// - new(): creates a Scraper in the WithoutServers state.
-/// - with_servers(): WithoutServers -> WithServers.
-/// - validate(): WithServers -> ValidatedAndReady
-///
-/// Notes:
-/// - You may only add servers in the WithoutServers state.
-/// - You may only validate the scraper in the WithServers state.
-/// - You may only scrape the servers in the ValidatedAndReady state.
-/// - Once the scraper is in the ValidatedAndReady state, it is no longer mutable.
-/// - If you use only_scrape_forced_repositories, only the repositories in the forced list will
-///   be scraped, meaning that ignored_repositories will have no effect.
-///
-/// ### Example
-///
-/// ```rust
-/// use cvmfs_server_scraper::{Scraper, ScraperCommon, Hostname, Server, ServerType, ServerBackendType};
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let servers = vec![
-///         Server::new(
-///             ServerType::Stratum1,
-///             ServerBackendType::CVMFS,
-///             Hostname::try_from("azure-us-east-s1.eessi.science").unwrap(),
-///         ),
-///         Server::new(
-///             ServerType::Stratum1,
-///             ServerBackendType::AutoDetect,
-///             Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
-///         ),
-///     ];
-///    
-///     let scraper = Scraper::new()
-///        .forced_repositories(vec!["repo1", "repo2"])
-///        .with_servers(servers)
-///        .only_scrape_forced_repositories(false) // this is the default
-///        .ignored_repositories(vec!["repo3", "repo4"])
-///        .geoapi_servers(vec!["cvmfs-stratum-one.cern.ch", "cvmfs-stratum-one.ihep.ac.cn"])?;
-///    
-///     let server_results = scraper.validate()?.scrape().await;
-///     Ok(())
-/// }
-/// ```
-pub struct Scraper<State = WithoutServers> {
-    servers: Option<Vec<Server>>,
-    forced_repos: Vec<String>,
-    only_scrape_forced_repos: bool,
-    ignored_repos: Vec<String>,
-    geoapi_servers: Vec<Hostname>,
-    _state: PhantomData<State>,
+/// Repository inclusion rules. Only mode has no exclusion state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositorySelection {
+    Only {
+        repositories: BTreeSet<RepositoryName>,
+    },
+    Discover {
+        include: BTreeSet<RepositoryName>,
+        exclude: BTreeSet<RepositoryName>,
+    },
+}
+impl Default for RepositorySelection {
+    fn default() -> Self {
+        Self::discover([], [])
+    }
+}
+impl RepositorySelection {
+    pub fn only(repositories: impl IntoIterator<Item = RepositoryName>) -> Self {
+        Self::Only {
+            repositories: repositories.into_iter().collect(),
+        }
+    }
+    pub fn discover(
+        include: impl IntoIterator<Item = RepositoryName>,
+        exclude: impl IntoIterator<Item = RepositoryName>,
+    ) -> Self {
+        Self::Discover {
+            include: include.into_iter().collect(),
+            exclude: exclude.into_iter().collect(),
+        }
+    }
+    pub(crate) fn resolve(
+        &self,
+        discovered: impl IntoIterator<Item = RepositoryName>,
+    ) -> BTreeSet<RepositoryName> {
+        match self {
+            Self::Only { repositories } => repositories.clone(),
+            Self::Discover { include, exclude } => include
+                .iter()
+                .cloned()
+                .chain(discovered)
+                .filter(|name| !exclude.contains(name))
+                .collect(),
+        }
+    }
+    fn configured_count(&self) -> usize {
+        match self {
+            Self::Only { repositories } => repositories.len(),
+            Self::Discover { include, exclude } => include.len().saturating_add(exclude.len()),
+        }
+    }
 }
 
-// Implementation for WithoutServers state
+/// Nonempty, unique, bounded query hosts. Empty input never silently enables defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeoapiHosts(Vec<Hostname>);
+impl GeoapiHosts {
+    pub fn new(hosts: Vec<Hostname>) -> Result<Self, ConfigurationError> {
+        if hosts.is_empty() || hosts.len() > 128 {
+            return Err(ConfigurationError {
+                field: "GeoAPI hosts",
+                reason: "expected 1..=128 hosts; use GeoapiProbe::Disabled to skip the probe"
+                    .into(),
+            });
+        }
+        if hosts.iter().collect::<BTreeSet<_>>().len() != hosts.len() {
+            return Err(ConfigurationError {
+                field: "GeoAPI hosts",
+                reason: "duplicate hostname".into(),
+            });
+        }
+        Ok(Self(hosts))
+    }
+    pub fn as_slice(&self) -> &[Hostname] {
+        &self.0
+    }
+}
+#[derive(Debug, Clone)]
+pub enum GeoapiProbe {
+    Disabled,
+    Enabled(GeoapiHosts),
+}
+impl Default for GeoapiProbe {
+    fn default() -> Self {
+        Self::Enabled(
+            GeoapiHosts::new(DEFAULT_GEOAPI_SERVERS.clone())
+                .expect("default hosts are unique and nonempty"),
+        )
+    }
+}
+
+/// Required repository failures fail the server. Optional metadata and GeoAPI
+/// failures are preserved in their own outcomes without discarding repository data.
+#[derive(Debug, Clone, Default)]
+pub struct ScrapeOptions {
+    selection: RepositorySelection,
+    geoapi: GeoapiProbe,
+    limits: ScrapeLimits,
+    redirects: RedirectPolicy,
+}
+impl ScrapeOptions {
+    pub fn with_selection(mut self, selection: RepositorySelection) -> Self {
+        self.selection = selection;
+        self
+    }
+    pub fn with_geoapi(mut self, probe: GeoapiProbe) -> Self {
+        self.geoapi = probe;
+        self
+    }
+    pub fn with_limits(mut self, limits: ScrapeLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+    pub fn with_redirects(mut self, policy: RedirectPolicy) -> Self {
+        self.redirects = policy;
+        self
+    }
+    pub fn selection(&self) -> &RepositorySelection {
+        &self.selection
+    }
+    pub fn geoapi(&self) -> &GeoapiProbe {
+        &self.geoapi
+    }
+    pub fn limits(&self) -> &ScrapeLimits {
+        &self.limits
+    }
+}
+
+pub struct WithoutServers {
+    options: ScrapeOptions,
+}
+pub struct WithServers {
+    servers: Vec<Server>,
+    options: ScrapeOptions,
+}
+pub struct ValidatedAndReady {
+    plan: ValidatedScrapePlan,
+    client: ScrapeClient,
+}
+
+/// Immutable plan whose options have been checked against these exact servers.
+/// No Deserialize implementation can manufacture this proof.
+pub struct ValidatedScrapePlan {
+    servers: Vec<Server>,
+    options: ScrapeOptions,
+}
+impl ValidatedScrapePlan {
+    fn new(servers: Vec<Server>, options: ScrapeOptions) -> Result<Self, ScrapeError> {
+        if servers.is_empty() {
+            return Err(ConfigurationError {
+                field: "servers",
+                reason: "at least one server is required".into(),
+            }
+            .into());
+        }
+        let limit = options.limits.repository_count().get();
+        let configured = options.selection.configured_count();
+        if configured > limit {
+            return Err(ScrapeError::RepositoryLimit {
+                actual: configured,
+                limit,
+            });
+        }
+        let effective = options.selection.resolve([]);
+        if effective.is_empty() {
+            if let Some(server) = servers
+                .iter()
+                .find(|s| s.backend_type() == ServerBackendType::S3)
+            {
+                return Err(ScrapeError::EmptyRepositoryList(
+                    server.endpoint().to_string(),
+                ));
+            }
+        }
+        Ok(Self { servers, options })
+    }
+    pub fn servers(&self) -> &[Server] {
+        &self.servers
+    }
+    pub fn options(&self) -> &ScrapeOptions {
+        &self.options
+    }
+}
+
+/// Builder with configuration methods available only before validation.
+///
+/// ```compile_fail
+/// use cvmfs_server_scraper::*;
+/// fn mutate_ready(ready: Scraper<ValidatedAndReady>) {
+///     ready.repository_selection(RepositorySelection::default());
+/// }
+/// ```
+///
+/// ```no_run
+/// use cvmfs_server_scraper::*;
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let server = Server::new(ServerType::Stratum1, ServerBackendType::AutoDetect,
+///     "https://example.org".parse()?);
+/// let results = Scraper::new()
+///     .repository_selection(RepositorySelection::only(["software.eessi.io".parse()?]))
+///     .with_servers(vec![server]).validate()?.scrape().await;
+/// # Ok(()) }
+/// ```
+pub struct Scraper<State = WithoutServers> {
+    state: State,
+}
 impl Default for Scraper<WithoutServers> {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl Scraper<WithoutServers> {
-    /// Create a new Scraper.
-    ///
-    /// This method creates a new Scraper with no servers added and in the
-    /// WithoutServers state. To add servers, use the with_servers() method.
     pub fn new() -> Self {
-        Scraper {
-            servers: None,
-            forced_repos: Vec::new(),
-            only_scrape_forced_repos: false,
-            ignored_repos: Vec::new(),
-            geoapi_servers: DEFAULT_GEOAPI_SERVERS.clone(),
-            _state: PhantomData,
+        Self {
+            state: WithoutServers {
+                options: ScrapeOptions::default(),
+            },
         }
     }
-
-    /// Add a list of servers to the scraper.
-    ///
-    /// This method transitions the scraper to the WithServers state, and you may
-    /// no longer add servers after calling this method.
     pub fn with_servers(self, servers: Vec<Server>) -> Scraper<WithServers> {
         Scraper {
-            servers: Some(servers),
-            forced_repos: self.forced_repos,
-            only_scrape_forced_repos: self.only_scrape_forced_repos,
-            ignored_repos: self.ignored_repos,
-            geoapi_servers: self.geoapi_servers,
-            _state: PhantomData,
+            state: WithServers {
+                servers,
+                options: self.state.options,
+            },
         }
     }
 }
-
-// Trait for common functionality across the WithoutServers and WithServers states.
-pub trait ScraperCommon {
-    /// Add a list of forced repositories to the scraper.
-    ///
-    /// Forced repositories are repositories that will be scraped even if they are not listed in
-    /// repositories.json. Using this is required if the backend type of any server is S3 as S3
-    /// servers do not have a repositories.json file.
-    fn forced_repositories<I, S>(self, repos: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-        Self: Sized;
-
-    /// Set whether to only scrape forced repositories.
-    ///
-    /// If set to true, only the repositories specified in the forced_repositories() method will be scraped.
-    /// If set to false (default), all repositories found in repositories.json will be scraped, unless
-    /// they are in the ignored_repositories() list.
-    fn only_scrape_forced_repositories(self, only: bool) -> Self
-    where
-        Self: Sized;
-
-    /// Add a list of ignored repositories to the scraper.
-    ///
-    /// Ignored repositories are repositories that will not be scraped even if they are listed in
-    /// repositories.json or are given via the forced_repositories() method. This is useful if you
-    /// want to exclude certain repositories from the scrape (e.g. dev/test repositories).
-    ///
-    /// If a repository is listed in both the forced and ignored lists, it will NOT be scraped.
-    ///
-    /// There is no attempt to validate the existence of any of the repositories in the ignored list.
-    /// If a repository is listed in the ignored list but does not exist, it will be silently ignored.
-    fn ignored_repositories<I, S>(self, repos: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-        Self: Sized;
-
-    /// Add a list of geoapi servers to the scraper.
-    ///
-    /// Geoapi servers are used to resolve the location of a server. This list contains the servers
-    /// that will be used for a GeoAPI query and they will be returned in the order of distance from
-    /// the querier.
-    ///
-    /// Defaults to `cvmfs_server_scraper::constants::DEFAULT_GEOAPI_SERVERS`.
-    ///
-    /// You may pass either something that can be converted into a Hostname (str/string) or a Hostname
-    /// directly. If you pass a Hostname, the conversion is infallible so it is safe to unwrap().
-    ///
-    /// ### Example
-    ///
-    /// ```rust
-    /// use std::convert::TryFrom;
-    /// use cvmfs_server_scraper::{Scraper, ScraperCommon, Hostname};
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     /// Using strings
-    ///     let scraper = Scraper::new()
-    ///        .geoapi_servers(vec!["cvmfs-stratum-one.cern.ch", "cvmfs-stratum-one.ihep.ac.cn"])?;
-    ///
-    ///     /// Using Hostname
-    ///     let hostnames: Vec<Hostname> = vec!["cvmfs-stratum-one.cern.ch".parse()?, "cvmfs-stratum-one.ihep.ac.cn".parse()?];
-    ///     let scraper = Scraper::new()
-    ///        .geoapi_servers(hostnames).unwrap();
-    ///     Ok(())
-    /// }
-    /// ```
-    fn geoapi_servers<I, S>(self, servers: I) -> Result<Self, HostnameError>
-    where
-        I: IntoIterator<Item = S>,
-        Hostname: TryFrom<S>,
-        <Hostname as TryFrom<S>>::Error: Into<HostnameError>,
-        Self: Sized;
+pub trait ScraperCommon: Sized {
+    fn options(self, options: ScrapeOptions) -> Self;
+    fn repository_selection(self, selection: RepositorySelection) -> Self;
+    fn geoapi(self, probe: GeoapiProbe) -> Self;
 }
-
-// Implement common functionality for WithoutServers state
-impl ScraperCommon for Scraper<WithoutServers> {
-    fn forced_repositories<I, S>(mut self, repos: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.forced_repos = repos.into_iter().map(Into::into).collect();
-        self
-    }
-
-    fn only_scrape_forced_repositories(mut self, only: bool) -> Self {
-        if only && !self.ignored_repos.is_empty() {
-            info!("Setting only_scrape_forced_repositories to true will ignore a non-empty ignored_repositories list.");
+macro_rules! builder_options {
+    ($state:ty) => {
+        impl ScraperCommon for Scraper<$state> {
+            fn options(mut self, options: ScrapeOptions) -> Self {
+                self.state.options = options;
+                self
+            }
+            fn repository_selection(mut self, selection: RepositorySelection) -> Self {
+                self.state.options.selection = selection;
+                self
+            }
+            fn geoapi(mut self, probe: GeoapiProbe) -> Self {
+                self.state.options.geoapi = probe;
+                self
+            }
         }
-
-        self.only_scrape_forced_repos = only;
-        self
-    }
-
-    fn ignored_repositories<I, S>(mut self, repos: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        if self.only_scrape_forced_repos {
-            info!("Setting ignored_repositories will have no effect when only_scrape_forced_repositories is set to true.");
-        }
-
-        self.ignored_repos = repos.into_iter().map(Into::into).collect();
-        self
-    }
-
-    fn geoapi_servers<I, S>(mut self, servers: I) -> Result<Self, HostnameError>
-    where
-        I: IntoIterator<Item = S>,
-        Hostname: TryFrom<S>,
-        <Hostname as TryFrom<S>>::Error: Into<HostnameError>,
-    {
-        self.geoapi_servers = servers
-            .into_iter()
-            .map(|s| Hostname::try_from(s).map_err(Into::into))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(self)
-    }
+    };
 }
-
-// Implement common functionality for WithServers state
-impl ScraperCommon for Scraper<WithServers> {
-    fn forced_repositories<I, S>(mut self, repos: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.forced_repos = repos.into_iter().map(Into::into).collect();
-        self
-    }
-
-    fn only_scrape_forced_repositories(mut self, only: bool) -> Self {
-        if only && !self.ignored_repos.is_empty() {
-            info!("Setting only_scrape_forced_repositories to true will ignore a non-empty ignored_repositories list.");
-        }
-
-        self.only_scrape_forced_repos = only;
-        self
-    }
-
-    fn ignored_repositories<I, S>(mut self, repos: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        if self.only_scrape_forced_repos {
-            info!("Setting ignored_repositories will have no effect when only_scrape_forced_repositories is set to true.");
-        }
-
-        self.ignored_repos = repos.into_iter().map(Into::into).collect();
-        self
-    }
-
-    fn geoapi_servers<I, S>(mut self, servers: I) -> Result<Self, HostnameError>
-    where
-        I: IntoIterator<Item = S>,
-        Hostname: TryFrom<S>,
-        <Hostname as TryFrom<S>>::Error: Into<HostnameError>,
-    {
-        self.geoapi_servers = servers
-            .into_iter()
-            .map(|s| Hostname::try_from(s).map_err(Into::into))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(self)
-    }
-}
-
-// Implementation for WithServers state
+builder_options!(WithoutServers);
+builder_options!(WithServers);
 impl Scraper<WithServers> {
-    /// Validate the scraper and transition to the ValidatedAndReady state.
-    ///
-    /// This method performs some basic pre-flight checks to ensure that the scraper is
-    /// correctly configured. If the checks pass, the scraper transitions to the
-    /// ValidatedAndReady state, and you may no longer add servers or repositories.
-    ///
-    /// The checks performed are:
-    /// - If any servers use the S3 backend, the forced repositories list cannot be empty.
     pub fn validate(self) -> Result<Scraper<ValidatedAndReady>, ScrapeError> {
-        if self
-            .servers
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|s| s.backend_type == ServerBackendType::S3)
-            && self.forced_repos.is_empty()
-        {
-            return Err(ScrapeError::EmptyRepositoryList(
-                "Forced repositories list cannot be empty if any servers use the S3 backend"
-                    .to_string(),
-            ));
-        }
+        let plan = ValidatedScrapePlan::new(self.state.servers, self.state.options)?;
+        let client = ScrapeClient::new(plan.options.limits.clone(), plan.options.redirects)?;
+        // Options are moved into the proof; the ready state exposes no setters.
         Ok(Scraper {
-            servers: self.servers,
-            forced_repos: self.forced_repos,
-            only_scrape_forced_repos: self.only_scrape_forced_repos,
-            ignored_repos: self.ignored_repos,
-            geoapi_servers: self.geoapi_servers,
-            _state: PhantomData,
+            state: ValidatedAndReady { plan, client },
         })
     }
 }
-
-// Implementation for ValidatedAndReady state
 impl Scraper<ValidatedAndReady> {
-    /// Scrape the servers.
-    ///
-    /// This method scrapes the servers and returns a list of ScrapedServer objects,
-    /// which contain the results of the scrape. This list will contain either
-    /// PopulatedServer objects or FailedServer objects, depending on whether the
-    /// scrape was successful or not for that specific server.
+    pub fn plan(&self) -> &ValidatedScrapePlan {
+        &self.state.plan
+    }
+    /// Results retain input server order. Each server has its own total deadline;
+    /// request permits are shared across all servers and released on cancellation.
     pub async fn scrape(&self) -> Vec<ScrapedServer> {
-        let servers = self.servers.as_ref().unwrap();
-        scrape_servers(
-            servers.clone(),
-            self.forced_repos.clone(),
-            self.ignored_repos.clone(),
-            self.only_scrape_forced_repos,
-            self.geoapi_servers.clone(),
-        )
-        .await
-    }
-}
-
-/// Scrape a list of servers in parallel.
-///
-/// This function scrapes a list of servers in parallel and returns a list of ScrapedServer objects,
-async fn scrape_servers<R>(
-    servers: Vec<Server>,
-    scrape_repos: Vec<R>,
-    ignored_repos: Vec<R>,
-    only_scrape_forced_repos: bool,
-    geoapi_hosts: Vec<Hostname>,
-) -> Vec<ScrapedServer>
-where
-    R: AsRef<str> + Debug + std::fmt::Display + Clone,
-{
-    let geoapi_servers = if geoapi_hosts.is_empty() {
-        debug!("No geoapi servers provided to scrape_server, using default servers");
-        DEFAULT_GEOAPI_SERVERS.clone()
-    } else {
-        geoapi_hosts
-    };
-
-    let start = Instant::now();
-    let scrapes_attempted = servers.len();
-    trace!(
-        "Start of scraping run. Servers: {:?}, repositories: {:?} (ignored: {:?}, forced_only: {:?}), geoapi_servers: {:?}",
-        servers,
-        scrape_repos,
-        ignored_repos,
-        only_scrape_forced_repos,
-        geoapi_servers
-    );
-    let futures = servers.iter().map(|server| {
-        let repolist = scrape_repos.clone();
-        let ignore = ignored_repos.clone();
-        let geoapi_servers = geoapi_servers.clone();
-        async move {
-            server
-                .scrape(
-                    repolist.clone(),
-                    ignore.clone(),
-                    only_scrape_forced_repos,
-                    Some(geoapi_servers.clone()),
+        let options = &self.state.plan.options;
+        let mut results: Vec<_> = stream::iter(0..self.state.plan.servers.len())
+            .map(|index| async move {
+                (
+                    index,
+                    self.state.plan.servers[index]
+                        .scrape_with(&self.state.client, options)
+                        .await,
                 )
-                .await
-        }
-    });
-
-    let scraped_servers = join_all(futures).await;
-
-    for server in scraped_servers.iter() {
-        match server {
-            ScrapedServer::Populated(popserver) => {
-                info!(
-                    "Scraped server: {} with {} repositories",
-                    popserver.hostname,
-                    popserver.repositories.len()
-                );
-            }
-            ScrapedServer::Failed(failedserver) => {
-                warn!(
-                    "Scraping failed for server: {} with error: {}",
-                    failedserver.hostname, failedserver.error
-                );
-            }
-        }
-    }
-
-    info!(
-        "Scraped {} servers ({} succeeded), run duration: {:?}",
-        scrapes_attempted,
-        scraped_servers.iter().filter(|s| s.is_ok()).count(),
-        start.elapsed()
-    );
-    trace!(
-        "Scraping servers completed with results: {:?}",
-        scraped_servers
-    );
-    scraped_servers
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::{Hostname, Server, ServerBackendType, ServerType};
-
-    #[tokio::test]
-    async fn test_online_cvmfs_servers_using_scrape_servers() {
-        let servers = vec![
-            Server::new(
-                ServerType::Stratum1,
-                ServerBackendType::CVMFS,
-                Hostname::try_from("azure-us-east-s1.eessi.science").unwrap(),
-            ),
-            Server::new(
-                ServerType::Stratum1,
-                ServerBackendType::CVMFS,
-                Hostname::try_from("aws-eu-central-s1.eessi.science").unwrap(),
-            ),
-            Server::new(
-                ServerType::SyncServer,
-                ServerBackendType::S3,
-                Hostname::try_from("aws-eu-west-s1-sync.eessi.science").unwrap(),
-            ),
-        ];
-
-        let repolist = vec!["software.eessi.io", "dev.eessi.io", "riscv.eessi.io"];
-        let results = scrape_servers(servers, repolist.clone(), vec![], false, vec![]).await;
-
-        for result in results {
-            match result {
-                ScrapedServer::Populated(popserver) => {
-                    for repo in repolist.clone() {
-                        assert!(popserver.has_repository(repo));
-                    }
-                }
-                ScrapedServer::Failed(failedserver) => {
-                    panic!("Error: {:?}", failedserver.error);
-                }
-            }
-        }
+            })
+            .buffer_unordered(options.limits.servers().get())
+            .collect()
+            .await;
+        results.sort_unstable_by_key(|(index, _)| *index);
+        results.into_iter().map(|(_, result)| result).collect()
     }
 }

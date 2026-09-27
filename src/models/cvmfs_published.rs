@@ -1,141 +1,253 @@
+use crate::{
+    CatalogSize, CatalogTtl, ContentHash, ManifestError, RepositoryName, Revision, RootPathMd5,
+    UnixTimestamp,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::BTreeMap, str::FromStr};
 
-use crate::errors::ManifestError;
-use crate::models::generic::HexString;
-use crate::utilities::{parse_boolean_field, parse_hex_field, parse_number_field};
+/// Hard parser bound, also applied when Manifest::from_bytes is called directly.
+pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
-/// The manifest of a repository or replica.
-///
-/// The fields are:
-/// - c: Cryptographic hash of the repository’s current root catalog
-/// - b: Size of the root file catalog in bytes
-/// - a: true if the catalog should be fetched under its alternative name
-/// - r: MD5 hash of the repository’s current root path (usually always d41d8cd98f00b204e9800998ecf8427e)
-/// - x: Cryptographic hash of the signing certificate
-/// - g: true if the repository is garbage-collectable
-/// - h: Cryptographic hash of the repository’s named tag history database
-/// - t: Unix timestamp of this particular revision
-/// - d: Time To Live (TTL) of the root catalog
-/// - s: Revision number of this published revision
-/// - n: The full name of the manifested repository
-/// - m: Cryptographic hash of the repository JSON metadata
-/// - y: Cryptographic hash of the reflog checksum
-/// - l: currently unused (reserved for micro catalogs)
-/// - signature: In order to provide authoritative information about a repository publisher, the
-///   repository manifest is signed by an X.509 certificate together with its private key.
-///   This field is not validated by this library.
-///
-/// Note that the field names are lowercase, but the field names in the manifest itself are uppercase.
-///
-/// See https://cvmfs.readthedocs.io/en/stable/cpt-details.html#repository-manifest-cvmfspublished for
-/// more information.
-#[derive(Deserialize, Serialize, Clone, PartialEq)]
-pub struct Manifest {
-    pub c: HexString,
-    pub b: i64,
-    pub a: bool,
-    pub r: HexString,
-    pub x: HexString,
-    pub g: bool,
-    pub h: HexString,
-    pub t: i64,
-    pub d: i32,
-    pub s: i32,
-    pub n: String,
-    pub m: HexString,
-    pub y: HexString,
-    pub l: String, // Currently unused
-    pub signature: String,
+/// Exact bytes following the manifest separator, including the checksum line.
+/// Presence does not imply that the signature is valid or trusted.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SignatureBytes(Vec<u8>);
+impl SignatureBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
-
-/// Debug implementation for Manifest
-///
-/// This implementation allows the struct to be printed with debug formatting,
-/// but only the fields are printed, not the signature (which is a binart blob).
-impl std::fmt::Debug for Manifest {
+impl std::fmt::Debug for SignatureBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Manifest")
-            .field("c", &self.c)
-            .field("b", &self.b)
-            .field("a", &self.a)
-            .field("r", &self.r)
-            .field("x", &self.x)
-            .field("g", &self.g)
-            .field("h", &self.h)
-            .field("t", &self.t)
-            .field("d", &self.d)
-            .field("s", &self.s)
-            .field("n", &self.n)
-            .field("m", &self.m)
-            .field("y", &self.y)
-            .field("l", &self.l)
-            .finish()
+        write!(f, "SignatureBytes({} bytes)", self.0.len())
     }
 }
 
-impl std::str::FromStr for Manifest {
+/// Parsed, unverified repository metadata. All scalar fields obey their protocol
+/// ranges. This type makes no cryptographic authenticity claim.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct Manifest {
+    c: ContentHash,
+    #[serde(default = "zero_size")]
+    b: CatalogSize,
+    #[serde(default)]
+    a: bool,
+    r: RootPathMd5,
+    x: Option<ContentHash>,
+    #[serde(default)]
+    g: bool,
+    h: Option<ContentHash>,
+    t: Option<UnixTimestamp>,
+    d: CatalogTtl,
+    s: Revision,
+    n: Option<RepositoryName>,
+    m: Option<ContentHash>,
+    y: Option<ContentHash>,
+    l: Option<ContentHash>,
+    signature: Option<SignatureBytes>,
+}
+fn zero_size() -> CatalogSize {
+    CatalogSize::new(0)
+}
+
+impl FromStr for Manifest {
     type Err = ManifestError;
-
     fn from_str(content: &str) -> Result<Self, Self::Err> {
-        let mut data: HashMap<char, String> = HashMap::new();
-        let mut signature: String = String::new();
-        let mut is_signature = false;
-
-        for line in content.lines() {
-            if line == "--" {
-                is_signature = true;
-                continue;
+        Self::from_bytes(content.as_bytes())
+    }
+}
+impl Manifest {
+    /// Parse the ASCII metadata envelope without decoding or changing binary signature bytes.
+    pub fn from_bytes(content: &[u8]) -> Result<Self, ManifestError> {
+        if content.len() > MAX_MANIFEST_BYTES {
+            return Err(ManifestError::TooLarge(MAX_MANIFEST_BYTES));
+        }
+        let mut data = BTreeMap::new();
+        let mut signature = None;
+        let mut offset = 0;
+        let mut line_number = 0;
+        while offset < content.len() {
+            line_number += 1;
+            let rest = &content[offset..];
+            let length = rest
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(rest.len(), |i| i + 1);
+            let line = rest[..length]
+                .strip_suffix(b"\n")
+                .unwrap_or(&rest[..length]);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            offset += length;
+            if line == b"--" {
+                signature = Some(SignatureBytes(content[offset..].to_vec()));
+                break;
             }
-            if is_signature {
-                signature.push_str(line);
-            } else {
-                let key = line.chars().next().unwrap();
-                let value = &line[1..];
-                data.insert(key, value.to_string());
+            let (&key, value) = line
+                .split_first()
+                .ok_or_else(|| ManifestError::InvalidLine {
+                    line: line_number,
+                    reason: "empty metadata line".into(),
+                })?;
+            if !key.is_ascii_uppercase() {
+                return Err(ManifestError::InvalidLine {
+                    line: line_number,
+                    reason: "field key must be an uppercase ASCII letter".into(),
+                });
+            }
+            let value = std::str::from_utf8(value).map_err(|_| ManifestError::InvalidLine {
+                line: line_number,
+                reason: "metadata value is not UTF-8".into(),
+            })?;
+            if data.insert(char::from(key), value).is_some() {
+                return Err(ManifestError::DuplicateField(char::from(key)));
             }
         }
-
-        let manifest = Manifest {
-            c: parse_hex_field(&data, 'C')?,
-            b: parse_number_field(&data, 'B')?,
-            a: parse_boolean_field(&data, 'A')?,
-            r: parse_hex_field(&data, 'R')?,
-            x: parse_hex_field(&data, 'X')?,
-            g: parse_boolean_field(&data, 'G')?,
-            h: parse_hex_field(&data, 'H')?,
-            t: parse_number_field(&data, 'T')?,
-            d: parse_number_field(&data, 'D')?,
-            s: parse_number_field(&data, 'S')?,
-            n: data
-                .get(&'N')
-                .ok_or(ManifestError::MissingField('N'))?
-                .clone(),
-            m: parse_hex_field(&data, 'M')?,
-            y: parse_hex_field(&data, 'Y')?,
-            l: data.get(&'L').cloned().unwrap_or_default(),
+        Ok(Self {
+            c: required(&data, 'C')?,
+            b: optional(&data, 'B')?.unwrap_or_else(zero_size),
+            a: flag(&data, 'A')?,
+            r: required(&data, 'R')?,
+            x: optional(&data, 'X')?,
+            g: flag(&data, 'G')?,
+            h: optional(&data, 'H')?,
+            t: optional(&data, 'T')?,
+            d: required(&data, 'D')?,
+            s: required(&data, 'S')?,
+            n: optional(&data, 'N')?,
+            m: optional(&data, 'M')?,
+            y: optional(&data, 'Y')?,
+            l: optional(&data, 'L')?,
             signature,
+        })
+    }
+    pub fn catalog_hash(&self) -> &ContentHash {
+        &self.c
+    }
+    pub fn catalog_size(&self) -> CatalogSize {
+        self.b
+    }
+    pub fn alternative_catalog_path(&self) -> bool {
+        self.a
+    }
+    pub fn root_path_hash(&self) -> &RootPathMd5 {
+        &self.r
+    }
+    pub fn certificate_hash(&self) -> Option<&ContentHash> {
+        self.x.as_ref()
+    }
+    pub fn garbage_collectable(&self) -> bool {
+        self.g
+    }
+    pub fn history_hash(&self) -> Option<&ContentHash> {
+        self.h.as_ref()
+    }
+    pub fn published_at(&self) -> Option<UnixTimestamp> {
+        self.t
+    }
+    pub fn ttl(&self) -> CatalogTtl {
+        self.d
+    }
+    pub fn revision(&self) -> Revision {
+        self.s
+    }
+    pub fn repository_name(&self) -> Option<&RepositoryName> {
+        self.n.as_ref()
+    }
+    pub fn metadata_hash(&self) -> Option<&ContentHash> {
+        self.m.as_ref()
+    }
+    pub fn reflog_hash(&self) -> Option<&ContentHash> {
+        self.y.as_ref()
+    }
+    pub fn micro_catalog_hash(&self) -> Option<&ContentHash> {
+        self.l.as_ref()
+    }
+    pub fn signature(&self) -> Option<&SignatureBytes> {
+        self.signature.as_ref()
+    }
+    pub fn output(&self) {
+        println!("{self:#?}");
+    }
+    /// Bind the server's identity claim to the requested repository. Missing N
+    /// remains explicitly Unspecified and never becomes a matched identity.
+    pub fn bind_to_repository(
+        self,
+        requested: RepositoryName,
+    ) -> Result<RepositoryManifest, ManifestError> {
+        let identity = match &self.n {
+            Some(actual) if actual != &requested => {
+                return Err(ManifestError::RepositoryMismatch {
+                    expected: requested.to_string(),
+                    actual: actual.to_string(),
+                })
+            }
+            Some(_) => RepositoryIdentity::Matched,
+            None => RepositoryIdentity::Unspecified,
         };
-
-        Ok(manifest)
+        Ok(RepositoryManifest {
+            requested,
+            manifest: self,
+            identity,
+        })
+    }
+}
+fn required<T: FromStr>(data: &BTreeMap<char, &str>, key: char) -> Result<T, ManifestError>
+where
+    T::Err: std::fmt::Display,
+{
+    optional(data, key)?.ok_or(ManifestError::MissingField(key))
+}
+fn optional<T: FromStr>(data: &BTreeMap<char, &str>, key: char) -> Result<Option<T>, ManifestError>
+where
+    T::Err: std::fmt::Display,
+{
+    data.get(&key)
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|e: T::Err| ManifestError::ParseError(key, e.to_string()))
+        })
+        .transpose()
+}
+fn flag(data: &BTreeMap<char, &str>, key: char) -> Result<bool, ManifestError> {
+    match data.get(&key) {
+        None | Some(&"no") => Ok(false),
+        Some(&"yes") => Ok(true),
+        Some(_) => Err(ManifestError::ParseError(
+            key,
+            "expected 'yes' or 'no'".into(),
+        )),
     }
 }
 
-impl Manifest {
-    pub fn output(&self) {
-        println!("  Manifest for repository: {}", self.n);
-        println!("    Root catalog hash: {}", self.c);
-        println!("    Root catalog size: {}", self.b);
-        println!("    Fetch under alternative name: {}", self.a);
-        println!("    Root path hash: {}", self.r);
-        println!("    Signing certificate hash: {}", self.x);
-        println!("    Garbage-collectable: {}", self.g);
-        println!("    Tag history hash: {}", self.h);
-        println!("    Revision timestamp: {}", self.t);
-        println!("    Root catalog TTL: {}", self.d);
-        println!("    Revision number: {}", self.s);
-        println!("    Metadata hash: {}", self.m);
-        println!("    Reflog checksum hash: {}", self.y);
-        // println!("  Signature: {}", self.signature);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RepositoryIdentity {
+    Matched,
+    Unspecified,
+}
+
+/// Proof that the manifest did not claim a different repository. Constructed
+/// only by Manifest::bind_to_repository; it cannot be forged with Deserialize.
+///
+/// ```compile_fail
+/// use cvmfs_server_scraper::RepositoryManifest;
+/// let forged: RepositoryManifest = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepositoryManifest {
+    requested: RepositoryName,
+    manifest: Manifest,
+    identity: RepositoryIdentity,
+}
+impl RepositoryManifest {
+    pub fn repository_name(&self) -> &RepositoryName {
+        &self.requested
+    }
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+    pub fn identity(&self) -> RepositoryIdentity {
+        self.identity
     }
 }
