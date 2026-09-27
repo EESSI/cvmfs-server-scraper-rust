@@ -14,9 +14,18 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        rust: ["1.88.0", stable]
+
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7.0.1
+    - name: Install Rust
+      run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --no-self-update
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --locked --verbose
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --locked --verbose

@@ -86,7 +86,7 @@ pub struct HexString(String);
 
 impl HexString {
     pub fn new(s: &str) -> Result<Self, ManifestError> {
-        if s.len() % 2 == 0 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        if s.len().is_multiple_of(2) && s.chars().all(|c| c.is_ascii_hexdigit()) {
             Ok(HexString(s.to_string().to_lowercase()))
         } else {
             Err(ManifestError::InvalidHex(s.to_string()))

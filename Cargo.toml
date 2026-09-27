@@ -2,7 +2,7 @@
 name = "cvmfs_server_scraper"
 version = "0.0.7"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Terje Kvernes <terje@kvernes.no>"]
 license = "MIT"
 description = "A scraper for CVMFS servers"
