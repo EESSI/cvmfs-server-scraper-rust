@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this will adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
 we reach version 0.1.0, up until then, expect breaking changes.
 
+## [Unreleased]
+
+### Changed
+
+- Updated all Rust dependencies to their latest compatible releases.
+- Raised the minimum supported Rust version to 1.88 for the updated dependencies.
+- Updated GitHub Actions checkout to v7.0.1 and added tests of the locked dependencies on Rust 1.88 and stable.
+
 ## [0.0.7] - 2026-06-08
 
 ### Changed
