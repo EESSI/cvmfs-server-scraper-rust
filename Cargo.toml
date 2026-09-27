@@ -24,5 +24,5 @@ log = "0.4"
 rand = "0.10"
 
 [dev-dependencies]
-yare = "3"
+rstest = { version = "0.27", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "test-util"] }

@@ -144,6 +144,8 @@ cargo fmt --all -- --check
 
 Default tests use local loopback fixtures and require permission to bind `127.0.0.1`. They do not contact production servers. Public smoke tests are opt-in with `cargo test --locked --test online -- --ignored`. Rust 1.88 is the minimum supported version; CI checks it and stable.
 
+Parameterized tests use `rstest` with named `#[case::name(...)]` cases. See [testing and coverage](docs/testing.md) for coverage commands, the measured baseline, remaining gaps, and CI reports.
+
 ## License
 
 MIT; see [LICENSE.txt](LICENSE.txt).

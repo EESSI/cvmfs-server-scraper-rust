@@ -1,7 +1,7 @@
 use cvmfs_server_scraper::*;
+use rstest::rstest;
 use serde_json::json;
 use std::time::Duration;
-use yare::parameterized;
 
 fn manifest() -> String {
     format!(
@@ -10,8 +10,17 @@ fn manifest() -> String {
     )
 }
 
-#[parameterized(empty = {""}, authority = {"trusted.example@127.0.0.1:8123/other?"}, path = {"example.org/path"}, query = {"example.org?x"}, unicode = {"éxample.org"}, empty_label = {"example..org"}, dash = {"-example.org"}, port = {"example.org:80"})]
-fn hostname_rejects_invalid_input_through_all_constructors(value: &str) {
+#[rstest]
+#[case::empty("")]
+#[case::authority("trusted.example@127.0.0.1:8123/other?")]
+#[case::path("example.org/path")]
+#[case::query("example.org?x")]
+#[case::unicode("éxample.org")]
+#[case::empty_label("example..org")]
+#[case::leading_dash("-example.org")]
+#[case::trailing_dash("example-.org")]
+#[case::port("example.org:80")]
+fn hostname_rejects_invalid_input_through_all_constructors(#[case] value: &str) {
     assert!(value.parse::<Hostname>().is_err());
     assert!(Hostname::try_from(value.to_owned()).is_err());
     assert!(serde_json::from_value::<Hostname>(json!(value)).is_err());
@@ -38,8 +47,18 @@ fn hostname_normalizes_case_accepts_punycode_and_checks_lengths() {
     .parse::<Hostname>()
     .is_err());
 }
-#[parameterized(traversal = {"../../admin?x="}, encoded = {"%2e%2e"}, slash = {"a/b"}, backslash = {"a\\b"}, query = {"a?b"}, fragment = {"a#b"}, blank = {""}, dot = {"."}, double_dot = {".."}, empty_label = {"repo..org"})]
-fn repository_name_rejects_url_syntax(value: &str) {
+#[rstest]
+#[case::traversal("../../admin?x=")]
+#[case::encoded("%2e%2e")]
+#[case::slash("a/b")]
+#[case::backslash("a\\b")]
+#[case::query("a?b")]
+#[case::fragment("a#b")]
+#[case::blank("")]
+#[case::dot(".")]
+#[case::double_dot("..")]
+#[case::empty_label("repo..org")]
+fn repository_name_rejects_url_syntax(#[case] value: &str) {
     assert!(value.parse::<RepositoryName>().is_err());
     assert!(serde_json::from_value::<RepositoryName>(json!(value)).is_err());
 }
@@ -56,24 +75,33 @@ fn repository_names_roundtrip_owned_and_escaped_json() {
     );
     assert!("a".repeat(256).parse::<RepositoryName>().is_err());
 }
-#[parameterized(credentials = {"http://user:password@example.org"}, path = {"http://example.org/cvmfs"}, query = {"http://example.org?x"}, fragment = {"http://example.org#x"}, scheme = {"file:///tmp/metadata"}, relative = {"example.org"}, whitespace = {" http://example.org"}, control = {"http://exam\nple.org"})]
-fn endpoint_validation_cannot_be_bypassed_by_serde(value: &str) {
+#[rstest]
+#[case::credentials("http://user:password@example.org")]
+#[case::path("http://example.org/cvmfs")]
+#[case::query("http://example.org?x")]
+#[case::fragment("http://example.org#x")]
+#[case::scheme("file:///tmp/metadata")]
+#[case::relative("example.org")]
+#[case::whitespace(" http://example.org")]
+#[case::control("http://exam\nple.org")]
+#[case::invalid_dns_label("https://-example.org")]
+fn endpoint_validation_cannot_be_bypassed_by_serde(#[case] value: &str) {
     assert!(value.parse::<ServerEndpoint>().is_err());
     assert!(serde_json::from_value::<ServerEndpoint>(json!(value)).is_err());
 }
-#[test]
-fn endpoints_support_explicit_ports_tls_and_ipv6() {
-    for text in [
-        "http://127.0.0.1:12345",
-        "https://example.org:8443",
-        "http://[::1]:12345",
-    ] {
-        let endpoint: ServerEndpoint = text.parse().unwrap();
-        assert_eq!(
-            serde_json::from_value::<ServerEndpoint>(json!(endpoint)).unwrap(),
-            endpoint
-        );
-    }
+#[rstest]
+#[case::ipv4("http://127.0.0.1:12345", "127.0.0.1")]
+#[case::https("https://example.org:8443", "example.org")]
+#[case::ipv6("http://[::1]:12345", "[::1]")]
+#[case::idna("https://bücher.example", "xn--bcher-kva.example")]
+fn endpoints_support_explicit_ports_tls_and_ipv6(#[case] text: &str, #[case] host: &str) {
+    let endpoint: ServerEndpoint = text.parse().unwrap();
+    assert_eq!(endpoint.host(), host);
+    assert_eq!(endpoint.as_url().host_str(), Some(host));
+    assert_eq!(
+        serde_json::from_value::<ServerEndpoint>(json!(endpoint)).unwrap(),
+        endpoint
+    );
 }
 #[test]
 fn malformed_manifest_input_returns_errors_without_panicking() {
@@ -136,9 +164,15 @@ fn manifests_accept_optional_fields_and_large_unsigned_values() {
 }
 #[test]
 fn hash_types_accept_supported_algorithms_and_require_exact_sizes() {
-    for suffix in ["", "-rmd160", "-shake128"] {
+    for (suffix, algorithm) in [
+        ("", HashAlgorithm::Sha1),
+        ("-rmd160", HashAlgorithm::Rmd160),
+        ("-shake128", HashAlgorithm::Shake128),
+    ] {
         let text = format!("{}{suffix}", "AB".repeat(20));
         let hash: ContentHash = text.parse().unwrap();
+        assert_eq!(hash.algorithm(), algorithm);
+        assert_eq!(hash.digest(), &[0xab; 20]);
         assert_eq!(hash.to_string(), text.to_ascii_lowercase());
         assert_eq!(
             serde_json::from_value::<ContentHash>(json!(hash)).unwrap(),
@@ -153,6 +187,7 @@ fn hash_types_accept_supported_algorithms_and_require_exact_sizes() {
         "",
         "ab",
         "zz",
+        &"zz".repeat(20),
         &"ab".repeat(19),
         &format!("{}-sha256", "ab".repeat(32)),
     ] {
@@ -282,4 +317,205 @@ fn limits_reject_zero_and_extreme_values() {
     assert!(ResponseByteLimit::new(0).is_err());
     assert!(ResponseByteLimit::new(usize::MAX).is_err());
     assert!(RepositoryLimit::new(0).is_err());
+}
+
+#[rstest]
+#[case::catalog('C')]
+#[case::root_path('R')]
+#[case::ttl('D')]
+#[case::revision('S')]
+fn missing_manifest_fields_identify_the_required_key(#[case] key: char) {
+    let input = manifest()
+        .lines()
+        .filter(|line| !line.starts_with(key))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        input.parse::<Manifest>(),
+        Err(ManifestError::MissingField(key))
+    );
+}
+
+#[rstest]
+#[case::lf("\n", true)]
+#[case::crlf("\r\n", true)]
+#[case::no_final_newline("\n", false)]
+fn optional_manifest_fields_survive_parsing_and_serde(
+    #[case] newline: &str,
+    #[case] final_newline: bool,
+) {
+    let digest = "0123456789abcdef0123456789abcdef01234567";
+    let input = format!(
+        "{}B18446744073709551615\nAyes\nGyes\nT1718984402\nX{digest}\nH{digest}-rmd160\nM{digest}-shake128\nY{digest}\nL{digest}\n",
+        manifest()
+    );
+    let input = if final_newline {
+        input.as_str()
+    } else {
+        input.trim_end()
+    };
+    let parsed = Manifest::from_bytes(input.replace('\n', newline).as_bytes()).unwrap();
+    assert_eq!(parsed.catalog_hash().digest(), &[0xab; 20]);
+    assert_eq!(parsed.catalog_size().get(), u64::MAX);
+    assert!(parsed.alternative_catalog_path());
+    assert!(parsed.garbage_collectable());
+    assert_eq!(
+        parsed.root_path_hash().digest(),
+        &[
+            0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+            0x42, 0x7e,
+        ]
+    );
+    assert_eq!(parsed.certificate_hash().unwrap().to_string(), digest);
+    assert_eq!(
+        parsed.history_hash().unwrap().algorithm(),
+        HashAlgorithm::Rmd160
+    );
+    assert_eq!(
+        parsed.metadata_hash().unwrap().algorithm(),
+        HashAlgorithm::Shake128
+    );
+    assert_eq!(parsed.reflog_hash(), parsed.micro_catalog_hash());
+    assert_eq!(parsed.reflog_hash(), parsed.certificate_hash());
+    assert_eq!(
+        parsed
+            .published_at()
+            .unwrap()
+            .datetime()
+            .unwrap()
+            .to_rfc3339(),
+        "2024-06-21T15:40:02+00:00"
+    );
+    assert_eq!(
+        serde_json::from_value::<Manifest>(json!(parsed)).unwrap(),
+        parsed
+    );
+}
+
+#[rstest]
+#[case::catalog("c", json!("zz".repeat(20)))]
+#[case::root_path("r", json!("ab".repeat(20)))]
+#[case::catalog_size("b", json!(-1))]
+#[case::ttl("d", json!(u64::from(u32::MAX) + 1))]
+#[case::revision("s", json!(-1))]
+#[case::timestamp("t", json!(-1))]
+#[case::repository("n", json!("../private"))]
+#[case::optional_hash("h", json!("unsupported"))]
+#[case::signature("signature", json!("not a byte array"))]
+fn manifest_serde_enforces_scalar_invariants(
+    #[case] field: &str,
+    #[case] value: serde_json::Value,
+) {
+    let mut data = json!(manifest().parse::<Manifest>().unwrap());
+    data[field] = value;
+    assert!(serde_json::from_value::<Manifest>(data).is_err());
+}
+
+#[rstest]
+#[case::true_flags("yes", true)]
+#[case::false_flags("no", false)]
+fn explicit_manifest_flags_are_not_confused_with_presence(
+    #[case] value: &str,
+    #[case] expected: bool,
+) {
+    let parsed: Manifest = format!("{}A{value}\nG{value}\n", manifest())
+        .parse()
+        .unwrap();
+    assert_eq!(parsed.alternative_catalog_path(), expected);
+    assert_eq!(parsed.garbage_collectable(), expected);
+}
+
+#[rstest]
+#[case::absent(None, Ok(None))]
+#[case::utc(
+    Some("Fri Jun 21 17:40:02 UTC 2024"),
+    Ok(Some("2024-06-21T17:40:02+00:00"))
+)]
+#[case::offset(
+    Some("Fri, 21 Jun 2024 19:40:02 +0200"),
+    Ok(Some("2024-06-21T17:40:02+00:00"))
+)]
+#[case::unresolved_zone(Some("Fri Jun 21 17:40:02 CEST 2024"), Err(()))]
+#[case::empty(Some(""), Err(()))]
+fn compatibility_timestamps_preserve_absent_parsed_and_unresolved_states(
+    #[case] raw: Option<&str>,
+    #[case] expected: Result<Option<&str>, ()>,
+) {
+    let timestamp = MaybeRfc2822DateTime::new(raw.map(str::to_owned));
+    let parsed = timestamp
+        .try_into_datetime()
+        .map(|instant| instant.map(|instant| instant.to_rfc3339()))
+        .map_err(|_| ());
+    assert_eq!(parsed, expected.map(|instant| instant.map(str::to_owned)));
+    assert_eq!(timestamp.is_some(), raw.is_some());
+    assert_eq!(timestamp.is_none(), raw.is_none());
+    assert_eq!(timestamp.as_ref().map(ReportedTimestamp::as_str), raw);
+    assert_eq!(timestamp.to_string(), raw.unwrap_or_default());
+    assert_eq!(serde_json::to_value(&timestamp).unwrap(), json!(raw));
+    assert_eq!(
+        serde_json::from_value::<MaybeRfc2822DateTime>(json!(raw)).unwrap(),
+        timestamp
+    );
+}
+
+#[rstest]
+#[case::concurrency(1024, |n| ConcurrencyLimit::new(n).map(ConcurrencyLimit::get))]
+#[case::response_bytes(64 * 1024 * 1024, |n| ResponseByteLimit::new(n).map(ResponseByteLimit::get))]
+#[case::repositories(100_000, |n| RepositoryLimit::new(n).map(RepositoryLimit::get))]
+fn bounded_limits_accept_both_edges_and_reject_values_outside(
+    #[case] maximum: usize,
+    #[case] construct: fn(usize) -> Result<usize, ConfigurationError>,
+) {
+    assert_eq!(construct(1).unwrap(), 1);
+    assert_eq!(construct(maximum).unwrap(), maximum);
+    assert!(construct(0).is_err());
+    assert!(construct(maximum + 1).is_err());
+}
+
+#[rstest]
+#[case::minimum(Duration::from_nanos(1), true)]
+#[case::maximum(Duration::from_secs(3600), true)]
+#[case::zero(Duration::ZERO, false)]
+#[case::over_maximum(Duration::from_secs(3600) + Duration::from_nanos(1), false)]
+fn request_timeout_enforces_exact_boundaries(#[case] value: Duration, #[case] accepted: bool) {
+    let result = RequestTimeout::new(value);
+    assert_eq!(result.is_ok(), accepted);
+    if let Ok(timeout) = result {
+        assert_eq!(timeout.get(), value);
+    }
+}
+
+#[test]
+fn geoapi_bounds_apply_to_direct_parsing_and_deserialization() {
+    let maximum_hosts: Vec<Hostname> = (0..128)
+        .map(|n| format!("host{n}.example").parse().unwrap())
+        .collect();
+    assert!(GeoapiHosts::new(maximum_hosts.clone()).is_ok());
+    let mut too_many = maximum_hosts;
+    too_many.push("extra.example".parse().unwrap());
+    assert!(GeoapiHosts::new(too_many.clone()).is_err());
+    let data = json!({"hosts": too_many, "response": (1..=129).collect::<Vec<_>>()});
+    assert!(serde_json::from_value::<GeoapiOrdering>(data).is_err());
+    assert!(GeoapiOrdering::from_response(hosts(), &"1".repeat(16 * 1024 + 1)).is_err());
+    // Padding is accepted only while the complete response fits the parser bound.
+    let padded = format!("{}1,2,3", " ".repeat(16 * 1024 - 5));
+    let ordering = GeoapiOrdering::from_response(hosts(), &padded).unwrap();
+    assert_eq!(ordering.hosts(), hosts());
+    assert_eq!(
+        ordering
+            .response()
+            .iter()
+            .map(|id| id.get())
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+}
+
+#[rstest]
+#[case::odd_length("a")]
+#[case::invalid_digit("gg")]
+#[case::unicode("é")]
+fn general_hex_validation_also_applies_during_deserialization(#[case] text: &str) {
+    assert!(HexString::new(text).is_err());
+    assert!(serde_json::from_value::<HexString>(json!(text)).is_err());
 }

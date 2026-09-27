@@ -47,6 +47,33 @@ jobs:
         if: matrix.rust == 'stable'
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install coverage tools
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview --no-self-update
+          cargo install cargo-llvm-cov --version 0.9.1 --locked
+      - name: Measure library coverage with loopback fixtures
+        run: |
+          mkdir -p target/llvm-cov
+          cargo llvm-cov --locked --all-targets --lcov --output-path target/llvm-cov/lcov.info
+      - name: Generate annotated coverage report
+        run: |
+          cargo llvm-cov report
+          cargo llvm-cov report --html
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: coverage
+          path: target/llvm-cov
+          if-no-files-found: error
+          retention-days: 14
+
   audit:
     runs-on: ubuntu-latest
     timeout-minutes: 15

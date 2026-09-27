@@ -26,6 +26,7 @@ we reach version 0.1.0, up until then, expect breaking changes.
 
 ### Changed
 
+- Replaced `yare` with `rstest` named cases, expanded domain and loopback regression coverage, and added downloadable CI coverage reports.
 - Updated all Rust dependencies to their latest compatible releases.
 - Raised the minimum supported Rust version to 1.88 for the updated dependencies.
 - Updated GitHub Actions checkout to v7.0.1 and added tests of the locked dependencies on Rust 1.88 and stable.

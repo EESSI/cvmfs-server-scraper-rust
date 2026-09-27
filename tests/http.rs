@@ -1,5 +1,6 @@
 mod support;
 use cvmfs_server_scraper::*;
+use rstest::rstest;
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -84,19 +85,27 @@ async fn preflight_rejects_empty_effective_s3_selection_and_empty_servers() {
         .iter()
         .all(|p| !p.ends_with("repositories.json")));
 }
+#[rstest]
+#[case::unauthenticated(401)]
+#[case::forbidden(403)]
+#[case::rate_limited(429)]
+#[case::server_error(500)]
+#[case::unavailable(503)]
 #[tokio::test]
-async fn autodetection_preserves_http_failures_and_only_assumes_s3_on_404() {
-    for status in [401, 403, 429, 500, 503] {
-        let fixture = Fixture::new(move |_| Reply::status(status, "error")).await;
-        let result = fixture
-            .server(ServerBackendType::AutoDetect)
-            .scrape(ScrapeOptions::default())
-            .await;
-        assert!(
-            matches!(result.as_failed_server().unwrap().error(), CVMFSScraperError::Scrape(ScrapeError::HttpStatus {status: actual, ..}) if *actual == status)
-        );
-        assert_eq!(fixture.requests.paths().len(), 1);
-    }
+async fn autodetection_preserves_http_failures(#[case] status: u16) {
+    let fixture = Fixture::new(move |_| Reply::status(status, "error")).await;
+    let result = fixture
+        .server(ServerBackendType::AutoDetect)
+        .scrape(ScrapeOptions::default())
+        .await;
+    assert!(
+        matches!(result.as_failed_server().unwrap().error(), CVMFSScraperError::Scrape(ScrapeError::HttpStatus {status: actual, ..}) if *actual == status)
+    );
+    assert_eq!(fixture.requests.paths().len(), 1);
+}
+
+#[tokio::test]
+async fn autodetection_only_assumes_s3_on_404() {
     let fixture = Fixture::new(|path| {
         if path.ends_with("repositories.json") {
             Reply::status(404, "")
@@ -604,6 +613,8 @@ async fn read_timeout_is_enforced_independently_of_total_deadlines() {
 async fn result_accessors_and_server_metadata_remain_consistent() {
     let fixture = Fixture::new(|path| if path.ends_with("repositories.json") {
         Reply::ok(r#"{"schema":1,"cvmfs_version":"2.11.3-1","last_geodb_update":"Fri Jun 21 17:40:02 UTC 2024","os_id":"rhel","os_version_id":"9","os_pretty_name":"Red Hat","repositories":[],"replicas":[{"name":"example.org"}]}"#)
+    } else if path.ends_with(".cvmfs_status.json") {
+        Reply::ok(r#"{"last_snapshot":"Fri Jun 21 17:40:02 UTC 2024","last_gc":"unresolved local date"}"#)
     } else { normal_reply(path) }).await;
     let result = fixture
         .server(ServerBackendType::CVMFS)
@@ -617,6 +628,28 @@ async fn result_accessors_and_server_metadata_remain_consistent() {
     assert_eq!(populated.backend(), BackendResolution::ConfiguredCvmfs);
     assert_eq!(populated.metadata().schema_version(), Some(1));
     assert_eq!(populated.metadata().os_id(), Some("rhel"));
+    assert_eq!(populated.metadata().os_version_id(), Some("9"));
+    assert_eq!(populated.metadata().os_pretty_name(), Some("Red Hat"));
+    assert_eq!(
+        populated.metadata().cvmfs_version().unwrap().to_string(),
+        "2.11.3-1"
+    );
+    let repository = &populated.repositories()[0];
+    assert_eq!(repository.revision().get(), 42);
+    assert_eq!(
+        repository
+            .last_snapshot()
+            .unwrap()
+            .datetime()
+            .unwrap()
+            .to_rfc3339(),
+        "2024-06-21T17:40:02+00:00"
+    );
+    assert_eq!(
+        repository.last_gc().unwrap().as_str(),
+        "unresolved local date"
+    );
+    assert!(repository.last_gc().unwrap().datetime().is_none());
     assert_eq!(
         serde_json::to_value(populated.metadata()).unwrap()["cvmfs_version"],
         "2.11.3-1"
@@ -635,4 +668,280 @@ async fn result_accessors_and_server_metadata_remain_consistent() {
     assert!(failure.as_populated_server().is_none());
     assert!(failure.clone().into_populated_server().is_err());
     assert!(failure.into_failed_server().is_ok());
+}
+
+#[rstest]
+#[case::only(RepositorySelection::only(["a.org".parse().unwrap(), "b.org".parse().unwrap()]))]
+#[case::discovery(RepositorySelection::discover(["a.org".parse().unwrap()], ["b.org".parse().unwrap()]))]
+#[tokio::test]
+async fn configured_repository_limit_fails_before_network_work(
+    #[case] selection: RepositorySelection,
+) {
+    let fixture = Fixture::new(normal_reply).await;
+    let result = Scraper::new()
+        .options(ScrapeOptions::default().with_limits(
+            ScrapeLimits::default().with_repository_count(RepositoryLimit::new(1).unwrap()),
+        ))
+        .with_servers(vec![fixture.server(ServerBackendType::CVMFS)])
+        .repository_selection(selection)
+        .validate();
+    assert!(matches!(
+        result,
+        Err(ScrapeError::RepositoryLimit {
+            actual: 2,
+            limit: 1
+        })
+    ));
+    assert!(fixture.requests.paths().is_empty());
+}
+
+#[tokio::test]
+async fn discovered_and_configured_union_also_obeys_repository_limit() {
+    let fixture = Fixture::new(normal_reply).await;
+    let options = ScrapeOptions::default()
+        .with_selection(RepositorySelection::discover(
+            ["additional.org".parse().unwrap()],
+            [],
+        ))
+        .with_limits(
+            ScrapeLimits::default().with_repository_count(RepositoryLimit::new(1).unwrap()),
+        );
+    let result = fixture
+        .server(ServerBackendType::CVMFS)
+        .scrape(options)
+        .await;
+    assert!(matches!(
+        result.as_failed_server().unwrap().error(),
+        CVMFSScraperError::Scrape(ScrapeError::RepositoryLimit {
+            actual: 2,
+            limit: 1
+        })
+    ));
+    assert_eq!(
+        fixture.requests.paths(),
+        ["/cvmfs/info/v1/repositories.json"]
+    );
+}
+
+#[rstest]
+#[case::missing_status(".cvmfs_status.json", 404)]
+#[case::failed_manifest(".cvmfspublished", 503)]
+#[tokio::test]
+async fn required_http_failures_do_not_discard_other_servers(
+    #[case] resource: &'static str,
+    #[case] status: u16,
+) {
+    let failed = Fixture::new(move |path| {
+        if path.ends_with(resource) {
+            Reply::status(status, "error")
+        } else {
+            normal_reply(path)
+        }
+    })
+    .await;
+    let healthy = Fixture::new(normal_reply).await;
+    let scraper = Scraper::default()
+        .with_servers(vec![
+            failed.server(ServerBackendType::S3),
+            healthy.server(ServerBackendType::S3),
+        ])
+        .repository_selection(RepositorySelection::only(["example.org".parse().unwrap()]))
+        .geoapi(GeoapiProbe::Disabled)
+        .validate()
+        .unwrap();
+    assert_eq!(scraper.plan().servers().len(), 2);
+    assert!(matches!(
+        scraper.plan().options().geoapi(),
+        GeoapiProbe::Disabled
+    ));
+    let results = scraper.scrape().await;
+    let failure = results[0].as_failed_server().unwrap();
+    assert_eq!(failure.server().endpoint(), &failed.endpoint);
+    assert!(
+        matches!(failure.error(), CVMFSScraperError::Scrape(ScrapeError::HttpStatus {status: actual, url})
+        if *actual == status && *url == format!("{}cvmfs/example.org/{resource}", failed.endpoint))
+    );
+    assert!(!failed
+        .requests
+        .paths()
+        .iter()
+        .any(|path| path.ends_with("meta.json")));
+    let populated = results[1].as_populated_server().unwrap();
+    assert_eq!(populated.server().endpoint(), &healthy.endpoint);
+    assert_eq!(populated.repositories().len(), 1);
+}
+
+#[rstest]
+#[case::index("repositories.json", ServerBackendType::AutoDetect)]
+#[case::status(".cvmfs_status.json", ServerBackendType::S3)]
+#[tokio::test]
+async fn invalid_required_json_preserves_url_and_source(
+    #[case] resource: &'static str,
+    #[case] backend: ServerBackendType,
+) {
+    let fixture = Fixture::new(move |path| {
+        if path.ends_with(resource) {
+            Reply::ok("not JSON")
+        } else {
+            normal_reply(path)
+        }
+    })
+    .await;
+    let result = fixture.server(backend).scrape(only(&["example.org"])).await;
+    let error = result.as_failed_server().unwrap().error();
+    let CVMFSScraperError::Scrape(ScrapeError::Json { url, source }) = error else {
+        panic!("expected JSON error, got {error}");
+    };
+    assert!(url.starts_with(fixture.endpoint.as_url().as_str()));
+    assert!(url.ends_with(resource));
+    assert!(source.is_syntax());
+    assert!(std::error::Error::source(error).is_some());
+    if backend == ServerBackendType::AutoDetect {
+        assert_eq!(fixture.requests.paths().len(), 1);
+    }
+}
+
+#[rstest]
+#[case::stratum0_with_replicas(ServerType::Stratum0, true, false)]
+#[case::sync_with_primaries(ServerType::SyncServer, false, false)]
+#[case::sync_with_replicas(ServerType::SyncServer, true, true)]
+#[tokio::test]
+async fn index_role_validation_applies_to_stratum0_and_sync_servers(
+    #[case] role: ServerType,
+    #[case] replicas: bool,
+    #[case] accepted: bool,
+) {
+    let fixture = Fixture::new(move |path| {
+        if path.ends_with("repositories.json") && !replicas {
+            Reply::ok(r#"{"schema":1,"repositories":[{"name":"example.org"}],"replicas":[]}"#)
+        } else {
+            normal_reply(path)
+        }
+    })
+    .await;
+    let server = Server::new(role, ServerBackendType::CVMFS, fixture.endpoint.clone());
+    assert_eq!(server.server_type(), role);
+    let result = server.scrape(only(&["example.org"])).await;
+    assert_eq!(result.is_populated(), accepted);
+    if !accepted {
+        assert!(matches!(
+            result.as_failed_server().unwrap().error(),
+            CVMFSScraperError::Scrape(ScrapeError::ServerTypeMismatch(_))
+        ));
+        assert_eq!(fixture.requests.paths().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn empty_cvmfs_selection_skips_geoapi_without_inventing_a_repository() {
+    let fixture = Fixture::new(normal_reply).await;
+    let populated = fixture
+        .server(ServerBackendType::CVMFS)
+        .scrape(ScrapeOptions::default().with_selection(RepositorySelection::only([])))
+        .await
+        .into_populated_server()
+        .unwrap();
+    assert!(populated.repositories().is_empty());
+    assert!(matches!(
+        populated.geoapi(),
+        GeoapiOutcome::Skipped(GeoapiSkipReason::NoRepositories)
+    ));
+    assert!(!fixture
+        .requests
+        .paths()
+        .iter()
+        .any(|path| path.contains("/geo/") || path.contains("/.cvmfs")));
+}
+
+#[tokio::test]
+async fn custom_geoapi_hosts_are_bound_to_the_query_and_response() {
+    let fixture = Fixture::new(|path| {
+        if path.contains("/geo/") {
+            Reply::ok("2,1")
+        } else {
+            normal_reply(path)
+        }
+    })
+    .await;
+    let hosts = vec!["two.org".parse().unwrap(), "one.org".parse().unwrap()];
+    let populated = Scraper::new()
+        .geoapi(GeoapiProbe::Enabled(
+            GeoapiHosts::new(hosts.clone()).unwrap(),
+        ))
+        .with_servers(vec![fixture.server(ServerBackendType::CVMFS)])
+        .validate()
+        .unwrap()
+        .scrape()
+        .await
+        .remove(0)
+        .into_populated_server()
+        .unwrap();
+    let GeoapiOutcome::Available(query) = populated.geoapi() else {
+        panic!("expected GeoAPI result")
+    };
+    assert_eq!(query.endpoint(), &fixture.endpoint);
+    assert_eq!(query.ordering().hosts(), hosts);
+    assert!(query.check_against_expected_order_by_id(&[
+        GeoapiHostId::new(2).unwrap(),
+        GeoapiHostId::new(1).unwrap()
+    ]));
+    assert!(!query.check_against_expected_order_by_hostname(&hosts));
+    assert!(fixture
+        .requests
+        .paths()
+        .iter()
+        .any(|path| path.ends_with("/two.org,one.org")));
+}
+
+#[rstest]
+#[case::non_utf8(Reply::ok(b"\xff\xfe"))]
+#[case::http_error(Reply::status(503, "unavailable"))]
+#[tokio::test]
+async fn geoapi_transport_and_encoding_failures_preserve_repositories(#[case] reply: Reply) {
+    let fixture = Fixture::new(move |path| {
+        if path.contains("/geo/") {
+            Reply::raw(reply.bytes.clone())
+        } else {
+            normal_reply(path)
+        }
+    })
+    .await;
+    let populated = fixture
+        .server(ServerBackendType::CVMFS)
+        .scrape(ScrapeOptions::default())
+        .await
+        .into_populated_server()
+        .unwrap();
+    assert_eq!(populated.repositories().len(), 1);
+    let GeoapiOutcome::Failed(error) = populated.geoapi() else {
+        panic!("expected GeoAPI failure")
+    };
+    assert!(error
+        .to_string()
+        .contains("/cvmfs/example.org/api/v1.0/geo/"));
+}
+
+#[rstest]
+#[case::content_length(false)]
+#[case::chunked(true)]
+#[tokio::test]
+async fn manifest_body_exactly_at_the_limit_is_accepted(#[case] chunked: bool) {
+    let body = manifest("example.org");
+    let limit = body.len();
+    let fixture = Fixture::new(move |path| {
+        if path.ends_with(".cvmfspublished") {
+            if chunked {
+                let head = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", body.len());
+                Reply::raw([head.as_bytes(), &body, b"\r\n0\r\n\r\n"].concat())
+            } else { Reply::ok(&body) }
+        } else { normal_reply(path) }
+    }).await;
+    let options = only(&["example.org"]).with_limits(
+        ScrapeLimits::default().with_manifest_bytes(ResponseByteLimit::new(limit).unwrap()),
+    );
+    assert!(fixture
+        .server(ServerBackendType::S3)
+        .scrape(options)
+        .await
+        .is_populated());
 }
