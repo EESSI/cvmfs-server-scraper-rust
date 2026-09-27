@@ -96,6 +96,12 @@ impl GeoapiOrdering {
     }
 }
 
+/// A completed query to a server's GeoAPI, bound to the queried host list.
+///
+/// GeoAPI URLs sit below a repository, but the response orders hosts rather than
+/// repository contents. The scraper uses the first selected repository's endpoint
+/// and retains the server origin here. Wire IDs are one-based; [`GeoapiOrdering`]
+/// validates that they form a complete permutation before exposing ordered hosts.
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct GeoapiServerQuery {
     endpoint: ServerEndpoint,
@@ -125,16 +131,25 @@ impl GeoapiServerQuery {
     }
 }
 
+/// Outcome of the optional GeoAPI probe, independent of repository success.
 #[derive(Debug, Clone)]
 pub enum GeoapiOutcome {
+    /// A valid ordering bound to the exact hosts sent in the query.
     Available(GeoapiServerQuery),
+    /// The resolved backend uses S3, which this scraper does not probe for GeoAPI.
     Unsupported,
+    /// No request was made for the given reason.
     Skipped(GeoapiSkipReason),
+    /// The request, decoding, or permutation validation failed.
     Failed(ScrapeError),
 }
+/// Reason a GeoAPI request was not attempted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeoapiSkipReason {
+    /// Disabled explicitly in configuration.
     Disabled,
+    /// The configured server is a Stratum0.
     Stratum0,
+    /// No selected repository provides a path under which to query GeoAPI.
     NoRepositories,
 }

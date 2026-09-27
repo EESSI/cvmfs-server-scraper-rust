@@ -46,6 +46,11 @@ jobs:
       - name: Clippy
         if: matrix.rust == 'stable'
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Documentation
+        if: matrix.rust == 'stable'
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps
 
   coverage:
     runs-on: ubuntu-latest

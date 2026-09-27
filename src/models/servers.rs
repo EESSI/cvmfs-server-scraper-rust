@@ -9,18 +9,26 @@ use crate::{
 use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
+/// Server role used to check whether a CVMFS index contains primaries or replicas.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy)]
 pub enum ServerType {
+    /// Origin server holding the primary repository data; its index must not list replicas.
     Stratum0,
+    /// Replica server holding copies of Stratum0 repositories.
     Stratum1,
+    /// Synchronization server holding replicated data without being a Stratum1 server.
     SyncServer,
 }
 
 /// Requested backend policy. AutoDetect falls back only on index HTTP 404.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy, Default)]
 pub enum ServerBackendType {
+    /// Skip index discovery and fetch explicitly selected repositories from an S3 backend.
     S3,
+    /// Require a valid `repositories.json` index consistent with the configured role.
     CVMFS,
+    /// Use a valid index when available; only an index HTTP 404 permits an S3 assumption.
+    /// Other HTTP, transport, and parsing failures remain errors.
     #[default]
     AutoDetect,
 }
@@ -28,9 +36,13 @@ pub enum ServerBackendType {
 /// Evidence for the backend choice. HTTP 404 is an assumption, not proof of S3.
 #[derive(Debug, Serialize, Clone, PartialEq, Eq, Copy)]
 pub enum BackendResolution {
+    /// The caller selected S3 explicitly.
     ConfiguredS3,
+    /// The caller selected CVMFS and its index passed validation.
     ConfiguredCvmfs,
+    /// Autodetection obtained and validated a CVMFS index.
     DiscoveredCvmfs,
+    /// Autodetection received an index HTTP 404 and used configured repository names.
     AssumedS3IndexNotFound,
 }
 impl BackendResolution {
@@ -39,6 +51,12 @@ impl BackendResolution {
     }
 }
 
+/// Configuration of a CVMFS server: its role, requested backend, and HTTP(S) origin.
+///
+/// Construction does not fetch metadata. [`Self::scrape`] returns a
+/// [`ScrapedServer`] containing either read-only results or the original
+/// configuration together with an error. Use [`Scraper`] to share a connection
+/// pool and request budget across multiple servers or repeated runs.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Server {
     server_type: ServerType,
@@ -47,6 +65,7 @@ pub struct Server {
     endpoint: ServerEndpoint,
 }
 impl Server {
+    /// Combine a server role and backend policy with a validated endpoint.
     pub fn new(
         server_type: ServerType,
         backend_type: ServerBackendType,
@@ -58,15 +77,19 @@ impl Server {
             endpoint,
         }
     }
+    /// Configured server role, checked against discovery data when available.
     pub fn server_type(&self) -> ServerType {
         self.server_type
     }
+    /// Requested backend policy; see [`PopulatedServer::backend`] for the outcome.
     pub fn backend_type(&self) -> ServerBackendType {
         self.backend_type
     }
+    /// Configured HTTP(S) origin, including any explicit port.
     pub fn endpoint(&self) -> &ServerEndpoint {
         &self.endpoint
     }
+    /// Host component of the origin, without its scheme or port; may be an IP address.
     pub fn hostname(&self) -> &str {
         self.endpoint.host()
     }
@@ -78,6 +101,25 @@ impl Server {
     }
 
     /// Convenience entry point using exactly the builder's validation and transport.
+    ///
+    /// Fetches the selected repositories' status files and manifests, plus optional
+    /// contact metadata and GeoAPI results. Options control selection, probe hosts,
+    /// deadlines, response sizes, and concurrency. Configuration and required-resource
+    /// errors produce [`ScrapedServer::Failed`]; optional failures are retained in
+    /// the successful [`PopulatedServer`]. Each call creates a new client; use a
+    /// validated [`Scraper`] when the connection pool should be reused across calls.
+    ///
+    /// ```no_run
+    /// use cvmfs_server_scraper::{RepositorySelection, ScrapeOptions, Server, ServerBackendType, ServerType};
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let server = Server::new(ServerType::SyncServer, ServerBackendType::S3,
+    ///     "http://aws-eu-west-s1-sync.eessi.science".parse()?);
+    /// let options = ScrapeOptions::default().with_selection(
+    ///     RepositorySelection::only(["software.eessi.io".parse()?]));
+    /// let result = server.scrape(options).await;
+    /// # let _ = result;
+    /// # Ok(()) }
+    /// ```
     pub async fn scrape(&self, options: ScrapeOptions) -> ScrapedServer {
         match Scraper::new()
             .options(options)
@@ -304,15 +346,25 @@ impl Server {
     }
 }
 
+/// Outcome of an optional resource fetch, preserving absence separately from failure.
 #[derive(Debug, Clone)]
 pub enum OptionalFetch<T> {
+    /// The resource was fetched and parsed successfully.
     Available(T),
+    /// The endpoint returned HTTP 404.
     Absent,
+    /// Fetching or parsing failed for another reason.
     Failed(ScrapeError),
 }
 
 /// Read-only result of the required fetches. Inspect ancillary contact/GeoAPI
 /// outcomes before treating the whole server as healthy.
+///
+/// Created only by a completed scrape. Primary repositories and replicas share
+/// [`Self::repositories`], sorted by name. The configured role determines which
+/// index entries are accepted. [`Self::metadata`] comes from the repository index;
+/// [`Self::contact`] independently describes the optional `meta.json` fetch.
+/// Index metadata is absent on S3, but contact metadata is still requested.
 #[derive(Debug, Clone)]
 pub struct PopulatedServer {
     server: Server,
@@ -323,27 +375,35 @@ pub struct PopulatedServer {
     geoapi: GeoapiOutcome,
 }
 impl PopulatedServer {
+    /// Original server configuration, including the requested backend policy.
     pub fn server(&self) -> &Server {
         &self.server
     }
+    /// Host component of the original server endpoint.
     pub fn hostname(&self) -> &str {
         self.server.hostname()
     }
+    /// Resolved backend and the evidence or configuration behind that choice.
     pub fn backend(&self) -> BackendResolution {
         self.backend
     }
+    /// Successful repository/replica results in lexical name order.
     pub fn repositories(&self) -> &[PopulatedRepositoryOrReplica] {
         &self.repositories
     }
+    /// Metadata obtained from the repository index, if this backend supplied one.
     pub fn metadata(&self) -> &ServerMetadata {
         &self.metadata
     }
+    /// Independent outcome of fetching optional server contact metadata.
     pub fn contact(&self) -> &OptionalFetch<ContactMetadata> {
         &self.contact
     }
+    /// Available ordering, skip/unsupported reason, or optional probe error.
     pub fn geoapi(&self) -> &GeoapiOutcome {
         &self.geoapi
     }
+    /// Whether the completed results contain the given repository or replica.
     pub fn has_repository(&self, name: &RepositoryName) -> bool {
         self.repositories.iter().any(|r| r.name() == name)
     }
@@ -361,6 +421,9 @@ impl std::fmt::Display for PopulatedServer {
     }
 }
 
+/// A failed scrape with the original server configuration and its error.
+/// Configuration failures, required-resource failures, and server deadlines all
+/// use this type. Optional probe failures stay on [`PopulatedServer`] instead.
 #[derive(Debug, Clone)]
 pub struct FailedServer {
     server: Server,
@@ -377,9 +440,12 @@ impl FailedServer {
         &self.error
     }
 }
+/// Result of scraping one configured server.
 #[derive(Debug, Clone)]
 pub enum ScrapedServer {
+    /// All selected repositories succeeded; ancillary probes may still have failed.
     Populated(Box<PopulatedServer>),
+    /// The configuration or a required part of the scrape failed.
     Failed(FailedServer),
 }
 impl ScrapedServer {
@@ -431,6 +497,12 @@ impl ScrapedServer {
     }
 }
 
+/// Server metadata from `cvmfs/info/v1/repositories.json`.
+///
+/// Fields are optional because an S3 backend has no index and CVMFS servers may
+/// omit version or OS details, including for privacy reasons. The schema is present
+/// for a successfully validated CVMFS index. Contact information from `meta.json`
+/// is kept separately in [`PopulatedServer::contact`].
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
 pub struct ServerMetadata {
     schema_version: Option<u32>,
@@ -441,21 +513,27 @@ pub struct ServerMetadata {
     os_id: Option<String>,
 }
 impl ServerMetadata {
+    /// Schema of the validated index, currently 1; absent without an index.
     pub fn schema_version(&self) -> Option<u32> {
         self.schema_version
     }
+    /// CVMFS server version reported by the index.
     pub fn cvmfs_version(&self) -> Option<&semver::Version> {
         self.cvmfs_version.as_ref()
     }
+    /// Reported GeoIP database update time; raw text remains available if unparseable.
     pub fn last_geodb_update(&self) -> Option<&ReportedTimestamp> {
         self.last_geodb_update.as_ref()
     }
+    /// Reported operating-system version, such as `9.4`.
     pub fn os_version_id(&self) -> Option<&str> {
         self.os_version_id.as_deref()
     }
+    /// Human-readable operating-system name.
     pub fn os_pretty_name(&self) -> Option<&str> {
         self.os_pretty_name.as_deref()
     }
+    /// Operating-system identifier, such as `rhel`.
     pub fn os_id(&self) -> Option<&str> {
         self.os_id.as_deref()
     }
@@ -465,6 +543,11 @@ impl ServerMetadata {
 }
 
 /// Bound repository result; only a completed scrape can construct this value.
+///
+/// Combines `.cvmfspublished` with optional snapshot and garbage-collection times
+/// from `.cvmfs_status.json`. Repositories and replicas use the same representation.
+/// [`Self::revision`] is a shortcut to the manifest's revision. Timestamp absence
+/// is distinct from a present but unparseable [`ReportedTimestamp`].
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct PopulatedRepositoryOrReplica {
     manifest: RepositoryManifest,
@@ -472,18 +555,23 @@ pub struct PopulatedRepositoryOrReplica {
     last_gc: Option<ReportedTimestamp>,
 }
 impl PopulatedRepositoryOrReplica {
+    /// Validated repository name used for the request and manifest binding.
     pub fn name(&self) -> &RepositoryName {
         self.manifest.repository_name()
     }
+    /// Parsed manifest bound to the requested repository, without signature verification.
     pub fn manifest(&self) -> &RepositoryManifest {
         &self.manifest
     }
+    /// Last snapshot time reported by the status file, if supplied.
     pub fn last_snapshot(&self) -> Option<&ReportedTimestamp> {
         self.last_snapshot.as_ref()
     }
+    /// Last garbage-collection time reported by the status file, if supplied.
     pub fn last_gc(&self) -> Option<&ReportedTimestamp> {
         self.last_gc.as_ref()
     }
+    /// Revision number from the bound manifest.
     pub fn revision(&self) -> Revision {
         self.manifest.manifest().revision()
     }

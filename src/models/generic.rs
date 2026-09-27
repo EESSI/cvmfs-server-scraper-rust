@@ -6,6 +6,12 @@ use crate::errors::{HostnameError, ManifestError, RepositoryNameError, ScrapeErr
 
 /// Canonical lowercase ASCII DNS name. International names must use IDNA punycode.
 /// Syntax validation does not authorize a network destination.
+///
+/// Names must contain 1..=253 bytes. Each dot-separated label contains 1..=63
+/// ASCII letters, digits, or hyphens and starts and ends with a letter or digit.
+/// Parsing, `TryFrom`, and serde all apply these rules and normalize case.
+/// Ports, URL syntax, and trailing dots are rejected; use [`crate::ServerEndpoint`]
+/// when configuring an HTTP(S) origin with a port.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(try_from = "String", into = "String")]
 pub struct Hostname(String);
@@ -33,6 +39,10 @@ impl FromStr for Hostname {
 }
 
 /// CVMFS repository identifier, never a URL or a path.
+///
+/// Accepts 1..=255 ASCII bytes consisting of letters, digits, dots, underscores,
+/// and hyphens, with no empty dot-separated components. Case is preserved.
+/// The same checks apply through parsing, `TryFrom`, and serde.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(try_from = "String", into = "String")]
 pub struct RepositoryName(String);
@@ -104,6 +114,10 @@ string_accessors!(Hostname, HostnameError);
 string_accessors!(RepositoryName, RepositoryNameError);
 
 /// General even-length hex text. Manifest digests use the stricter ContentHash type.
+///
+/// Accepts only ASCII hexadecimal characters (`0`–`9`, `a`–`f`, `A`–`F`) and
+/// stores them in lowercase. The empty string is valid general hex text; it is
+/// not a valid [`crate::ContentHash`] or [`crate::RootPathMd5`].
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(try_from = "String", into = "String")]
 pub struct HexString(String);
@@ -126,6 +140,13 @@ string_accessors!(HexString, ManifestError);
 
 /// A server's timestamp claim. Unrecognized/localized text is retained without
 /// pretending it specifies a UTC instant. Serde always recomputes the state.
+///
+/// CVMFS JSON timestamps are often produced by the server's `date` command, so
+/// their formatting and timezone names can depend on that server's locale.
+/// This wrapper preserves the original text even when it cannot be interpreted.
+/// [`Self::datetime`] accepts recognized RFC 2822 dates and GNU date-style strings
+/// with UTC, GMT, or numeric offsets. Unknown or ambiguous zone names stay unparsed.
+/// [`Self::try_into_datetime`] reports an error when no instant is available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 pub struct ReportedTimestamp(TimestampState);
@@ -185,6 +206,11 @@ impl fmt::Display for ReportedTimestamp {
 }
 
 /// Compatibility wrapper; new models use `Option<ReportedTimestamp>` directly.
+///
+/// Retains the old optional-string shape while distinguishing absent data from
+/// a present but unparseable value. [`Self::try_into_datetime`] returns `Ok(None)`
+/// for absence, `Ok(Some(_))` for a recognized instant, and an error for unresolved
+/// text. [`Self::as_ref`] always permits access to the original text when present.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(transparent)]
 pub struct MaybeRfc2822DateTime(Option<ReportedTimestamp>);

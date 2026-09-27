@@ -10,10 +10,12 @@ pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
 /// Exact bytes following the manifest separator, including the checksum line.
 /// Presence does not imply that the signature is valid or trusted.
+/// Debug output shows only the byte count so binary signature data is not printed.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SignatureBytes(Vec<u8>);
 impl SignatureBytes {
+    /// Borrow the original signature section without text decoding or newline changes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -26,6 +28,35 @@ impl std::fmt::Debug for SignatureBytes {
 
 /// Parsed, unverified repository metadata. All scalar fields obey their protocol
 /// ranges. This type makes no cryptographic authenticity claim.
+///
+/// A repository or replica publishes this data in `.cvmfspublished`. The wire
+/// format uses uppercase one-letter keys; serde retains lowercase keys for this
+/// struct. Accessors describe their meanings:
+///
+/// | Wire key | Accessor | Meaning |
+/// | --- | --- | --- |
+/// | `C` | [`catalog_hash`](Self::catalog_hash) | Current root catalog digest. |
+/// | `B` | [`catalog_size`](Self::catalog_size) | Root catalog size in bytes. |
+/// | `A` | [`alternative_catalog_path`](Self::alternative_catalog_path) | Whether the catalog uses an alternative path. |
+/// | `R` | [`root_path_hash`](Self::root_path_hash) | MD5 digest of the repository root path. |
+/// | `X` | [`certificate_hash`](Self::certificate_hash) | Signing certificate digest. |
+/// | `G` | [`garbage_collectable`](Self::garbage_collectable) | Whether garbage collection is enabled. |
+/// | `H` | [`history_hash`](Self::history_hash) | Named-tag history database digest. |
+/// | `T` | [`published_at`](Self::published_at) | Revision publication time as Unix seconds. |
+/// | `D` | [`ttl`](Self::ttl) | Root catalog time to live in seconds. |
+/// | `S` | [`revision`](Self::revision) | Published revision number. |
+/// | `N` | [`repository_name`](Self::repository_name) | Repository name claimed by the manifest. |
+/// | `M` | [`metadata_hash`](Self::metadata_hash) | Repository JSON metadata digest. |
+/// | `Y` | [`reflog_hash`](Self::reflog_hash) | Reflog checksum digest. |
+/// | `L` | [`micro_catalog_hash`](Self::micro_catalog_hash) | Reserved micro-catalog digest. |
+///
+/// Parsing requires `C`, `R`, `D`, and `S`. Missing `B` defaults to zero; missing
+/// `A` and `G` default to false. Other fields remain optional. The bytes after
+/// the `--` separator are retained in [`Self::signature`], including the checksum
+/// line and binary signature, without certificate or signature verification.
+///
+/// See the [CVMFS manifest format](https://cvmfs.readthedocs.io/en/stable/cpt-details/#repository-manifest-cvmfspublished)
+/// for the protocol description.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct Manifest {
     c: ContentHash,
@@ -59,6 +90,15 @@ impl FromStr for Manifest {
 }
 impl Manifest {
     /// Parse the ASCII metadata envelope without decoding or changing binary signature bytes.
+    ///
+    /// Accepts LF or CRLF metadata lines and an unterminated final line. Unknown
+    /// uppercase keys are ignored after checking line structure and uniqueness.
+    /// Use this byte entry point for network data because the signature may not be UTF-8.
+    ///
+    /// # Errors
+    ///
+    /// Rejects input larger than 1 MiB, empty or malformed metadata lines,
+    /// duplicate keys, missing required fields, and invalid field values.
     pub fn from_bytes(content: &[u8]) -> Result<Self, ManifestError> {
         if content.len() > MAX_MANIFEST_BYTES {
             return Err(ManifestError::TooLarge(MAX_MANIFEST_BYTES));
@@ -121,56 +161,77 @@ impl Manifest {
             signature,
         })
     }
+    /// Digest of the current root catalog (`C`).
     pub fn catalog_hash(&self) -> &ContentHash {
         &self.c
     }
+    /// Root catalog size in bytes (`B`), defaulting to zero when omitted.
     pub fn catalog_size(&self) -> CatalogSize {
         self.b
     }
+    /// Whether the catalog should be fetched under its alternative name (`A`).
     pub fn alternative_catalog_path(&self) -> bool {
         self.a
     }
+    /// MD5 digest of the root path (`R`), usually the digest of an empty path.
     pub fn root_path_hash(&self) -> &RootPathMd5 {
         &self.r
     }
+    /// Optional signing certificate digest (`X`); no certificate is fetched or verified.
     pub fn certificate_hash(&self) -> Option<&ContentHash> {
         self.x.as_ref()
     }
+    /// Whether the manifest enables garbage collection (`G`).
     pub fn garbage_collectable(&self) -> bool {
         self.g
     }
+    /// Optional named-tag history database digest (`H`).
     pub fn history_hash(&self) -> Option<&ContentHash> {
         self.h.as_ref()
     }
+    /// Optional Unix timestamp of the published revision (`T`).
     pub fn published_at(&self) -> Option<UnixTimestamp> {
         self.t
     }
+    /// Root catalog time to live in seconds (`D`).
     pub fn ttl(&self) -> CatalogTtl {
         self.d
     }
+    /// Published revision number (`S`).
     pub fn revision(&self) -> Revision {
         self.s
     }
+    /// Optional name claimed in `N`, before binding to a requested repository.
     pub fn repository_name(&self) -> Option<&RepositoryName> {
         self.n.as_ref()
     }
+    /// Optional repository JSON metadata digest (`M`).
     pub fn metadata_hash(&self) -> Option<&ContentHash> {
         self.m.as_ref()
     }
+    /// Optional reflog checksum digest (`Y`).
     pub fn reflog_hash(&self) -> Option<&ContentHash> {
         self.y.as_ref()
     }
+    /// Optional digest in the reserved micro-catalog field (`L`).
     pub fn micro_catalog_hash(&self) -> Option<&ContentHash> {
         self.l.as_ref()
     }
+    /// Exact bytes following `--`, or `None` if no separator was present.
     pub fn signature(&self) -> Option<&SignatureBytes> {
         self.signature.as_ref()
     }
+    /// Print debug metadata to stdout, showing only the signature's byte count.
     pub fn output(&self) {
         println!("{self:#?}");
     }
     /// Bind the server's identity claim to the requested repository. Missing N
     /// remains explicitly Unspecified and never becomes a matched identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::RepositoryMismatch`] when `N` differs from the
+    /// requested name. A successful binding does not authenticate the publisher.
     pub fn bind_to_repository(
         self,
         requested: RepositoryName,
@@ -221,9 +282,12 @@ fn flag(data: &BTreeMap<char, &str>, key: char) -> Result<bool, ManifestError> {
     }
 }
 
+/// Relationship between a manifest's optional name claim and the requested name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RepositoryIdentity {
+    /// The manifest's `N` field matches the requested repository.
     Matched,
+    /// No `N` field was supplied; no name agreement is claimed.
     Unspecified,
 }
 
@@ -241,12 +305,15 @@ pub struct RepositoryManifest {
     identity: RepositoryIdentity,
 }
 impl RepositoryManifest {
+    /// Requested repository name used to establish this binding.
     pub fn repository_name(&self) -> &RepositoryName {
         &self.requested
     }
+    /// Parsed, unverified manifest associated with the request.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
+    /// Whether the manifest explicitly matched the requested name or omitted it.
     pub fn identity(&self) -> RepositoryIdentity {
         self.identity
     }
