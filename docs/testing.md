@@ -8,7 +8,42 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The suite uses `rstest` named `#[case::name(...)]` cases for input matrices and Tokio for async tests. `rstest` is a development dependency with its optional features disabled; the tests do not need its timeout runtime or crate-renaming support. HTTP fixtures bind ephemeral loopback ports and do not contact production servers. The ten public-server checks remain opt-in.
+The suite uses `rstest` named `#[case::name(...)]` cases for input matrices and Tokio for async tests. `rstest` is a development dependency with its optional features disabled; the tests do not need its timeout runtime or crate-renaming support. HTTP fixtures bind ephemeral loopback ports and do not contact production servers. The real-server suites are ignored by default: CI runs the disposable testbed separately on every PR, while the ten public-server checks remain opt-in.
+
+## Disposable CVMFS integration tests
+
+The **CVMFS testbed** workflow runs on pull requests, pushes to `main`, and manual dispatch. It uses [cvmfs-testbed](https://github.com/terjekv/cvmfs-testbed), pinned to commit `0d67397762932c3e8e15a5b824605bd6715a0daf`, with CVMFS 2.14.1 on an `ubuntu-24.04` Docker runner. It needs no repository secrets or public CVMFS servers. Image and package downloads still require network access, and the publisher requires privileged containers. Pinning the harness does not pin every image digest or Ubuntu package.
+
+The 17 cases in `tests/testbed.rs` exercise this crate against the native publisher, local-storage replica, and S3-backed replica:
+
+| Scenario | Checks |
+| --- | --- |
+| Discovery and native data | Explicit and detected CVMFS/S3 backends; real S0/S1 indexes, manifests, status files, optional timestamps, name binding, signatures, and serialization. |
+| Repository selection and roles | Exact selection and discovery exclusions on S0/S1; rejection of publisher/replica role mismatches. |
+| Publication and replication | Revision and catalog changes; both directions of selective replica lag; recovery; unchanged second repository; matching signature bytes after replication. |
+| Failures and recovery | Stop S0, S1, S3 frontend/worker, or object storage; pause S1 for a timeout; preserve unaffected results and recover using the same validated scraper. |
+| Idle client reuse | Reuse the same validated scraper after 20 seconds without requests; retain repository data after native server keep-alive expiry. |
+
+The suite reads `endpoints.json` from `CVMFS_TESTBED_STATE` and invokes `cvmfs-testbed` from `PATH` against that same state directory. The action sets both automatically. Missing configuration fails explicitly when the ignored tests are requested. All cases share an async lock, so environment mutations remain serialized even without `--test-threads=1`. Stopped or paused services are restored during assertion unwinding; the action removes the entire deployment after the job.
+
+To run locally, start a **disposable** deployment using the pinned harness (Docker Desktop on macOS or a suitable Linux engine), then run from this crate:
+
+```sh
+# Set this to your checkout of terjekv/cvmfs-testbed at the pinned commit above.
+export PATH="/path/to/cvmfs-testbed/bin:$PATH"
+export CVMFS_TESTBED_STATE="$(mktemp -d)/state"
+cvmfs-testbed up --runtime docker --cvmfs-version 2.14.1
+cargo test --locked --test testbed -- --ignored --test-threads=1 --nocapture
+# Also collect diagnostics and tear down if setup or tests fail.
+cvmfs-testbed logs --output target/testbed-logs
+cvmfs-testbed down
+```
+
+Tests use at most two in-flight HTTP requests per scraper, a 20-second deadline per admitted server, and a 30-second outer bound for mixed-server scrapes. After restoring a service, the harness waits up to 60 seconds for repository HTTP readiness before the scraper's recovery assertion; a running container alone does not mean S3 has finished starting. The workflow has a 20-minute limit, uploads diagnostics even after setup/test failure, and uses the action's post-job cleanup. No scraper retries or silent skips are added.
+
+GeoAPI is disabled because the fixture has no working ordering service. Contact metadata is not assumed to contain EESSI values. Signatures are compared as bytes, not cryptographically verified. Direct scrapes bypass Squid. TLS/DNS failures, malformed responses, detailed resource boundaries, production proxy policies, and cloud-provider behavior remain outside this suite; retain loopback regressions and the separate EESSI checks. Testbed tests are excluded from the deterministic coverage baseline.
+
+The HTTP client expires idle connections after five seconds, while retaining the shared client and request budget. The dedicated idle-reuse case and object-storage recovery case guard against stalled reuse of unused pooled connections observed with native Apache on both macOS and Linux. They do not retry failed scrapes.
 
 ## Online EESSI checks
 

@@ -296,6 +296,9 @@ impl ScrapeClient {
             }),
         };
         let client = Client::builder()
+            // Bound retention of unused speculative connections. Native Apache
+            // integration tests exposed stalled reuse after longer idle gaps.
+            .pool_idle_timeout(Duration::from_secs(5))
             .connect_timeout(limits.connect_timeout.get())
             .read_timeout(limits.read_timeout.get())
             .timeout(limits.request_timeout.get())

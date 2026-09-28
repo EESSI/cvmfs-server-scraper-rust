@@ -1,0 +1,64 @@
+name: CVMFS testbed
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable
+      CVMFS_TESTBED_STATE: ${{ github.workspace }}/.cvmfs-testbed
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      # Keep the CLI at a known path so diagnostics also work if setup fails.
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: terjekv/cvmfs-testbed
+          ref: 0d67397762932c3e8e15a5b824605bd6715a0daf
+          path: .testbed-action
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-testbed-stable-${{ hashFiles('Cargo.lock') }}
+      - name: Compile integration tests
+        run: cargo test --locked --test testbed --no-run
+      - name: Start CVMFS testbed
+        uses: ./.testbed-action
+        with:
+          state-directory: ${{ env.CVMFS_TESTBED_STATE }}
+          runtime: docker
+          cvmfs-version: '2.14.1'
+      - name: Test real CVMFS servers and failure recovery
+        run: cargo test --locked --test testbed -- --ignored --test-threads=1 --nocapture
+      - name: Collect diagnostics
+        if: always()
+        run: .testbed-action/bin/cvmfs-testbed logs --output artifacts/testbed
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: testbed-logs
+          path: artifacts/testbed
+          if-no-files-found: warn
+          retention-days: 14

@@ -73,7 +73,7 @@ GeoAPI uses one-based IDs. `GeoapiOrdering` validates a complete permutation aga
 
 Redirects are disabled by default. `RedirectPolicy::SameOrigin` permits at most five redirects within the original scheme, host, and port. Cross-origin redirects and HTTPS downgrades are rejected. Choose an HTTPS endpoint when supported by the server. Hostname/endpoint syntax validation is not network authorization: applications accepting untrusted server configuration must enforce their own permitted destinations and network access policy.
 
-A validated scraper reuses one connection pool and global request budget across runs. Defaults are:
+A validated scraper reuses one HTTP client and global request budget across runs. Idle connections expire after five seconds, avoiding stale unused connections between scrape cycles. Defaults are:
 
 | Setting | Default |
 | --- | --- |
@@ -142,7 +142,9 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Default tests use local loopback fixtures and require permission to bind `127.0.0.1`. They do not contact production servers. Add the `online-tests` label to a PR to enable the separate online CI workflow, or run `cargo test --locked --test online -- --ignored --test-threads=1` locally. The ten online cases exercise the public EESSI Stratum1 and S3 deployments. Rust 1.88 is the minimum supported version; CI checks it and stable.
+Default tests use local loopback fixtures and require permission to bind `127.0.0.1`. They do not contact production servers. A separate CI job runs 17 integration cases against a disposable [CVMFS testbed](https://github.com/terjekv/cvmfs-testbed) on every PR, covering real S0/S1/S3 data, publication, replication lag, outages, and recovery. See [testing and coverage](docs/testing.md) for local testbed setup.
+
+Add the `online-tests` label to a PR to enable the separate online CI workflow, or run `cargo test --locked --test online -- --ignored --test-threads=1` locally. The ten online cases exercise the public EESSI Stratum1 and S3 deployments. Rust 1.88 is the minimum supported version; CI checks it and stable.
 
 Parameterized tests use `rstest` with named `#[case::name(...)]` cases. See [testing and coverage](docs/testing.md) for coverage commands, the measured baseline, remaining gaps, and CI reports.
 
