@@ -3,8 +3,6 @@ name: Publish to crates.io
 on:
   push:
     tags: ["v*"]
-  pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -28,7 +26,6 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Check release tag matches the crate version
-        if: github.event_name == 'push'
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |

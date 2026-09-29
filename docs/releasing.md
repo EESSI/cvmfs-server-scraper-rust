@@ -6,8 +6,9 @@ Releases use Git tags named `v<VERSION>`, matching `[package].version` in
 runs the default test suite, verifies the packaged crate, and publishes it using
 [crates.io trusted publishing](https://crates.io/docs/trusted-publishing).
 
-Pull requests run the same tests and package dry run without publishing or
-requesting an OIDC token. Only tag pushes in `EESSI/cvmfs-server-scraper-rust`
+The [Rust CI workflow](../.github/workflows/rust.yml) runs tests and a package dry
+run on pull requests and `main` without publishing or requesting an OIDC token.
+Only tag pushes in `EESSI/cvmfs-server-scraper-rust`
 can start the publishing job. The job uses the `crates-io` GitHub environment and
 the [official authentication action](https://github.com/rust-lang/crates-io-auth-action)
 to obtain a short-lived token, which the action revokes when the job finishes.
@@ -17,10 +18,15 @@ No long-lived crates.io token is required in GitHub secrets.
 
 Before pushing the first tag that includes this workflow:
 
-1. In the repository's **Settings → Environments**, create an environment named
+1. Have an EESSI administrator add
+   `rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18`
+   (v1.0.5) to the allowed actions in **Settings → Actions → General**. EESSI's
+   current policy blocks this action; the publishing workflow cannot start until
+   it is allowed. Keep this entry aligned when updating the action's pinned commit.
+2. In the repository's **Settings → Environments**, create an environment named
    `crates-io`. Configure **Selected branches and tags** to allow tags matching
    `v*`. Add required reviewers if release approval is desired.
-2. As an owner of `cvmfs_server_scraper`, open the crate's
+3. As an owner of `cvmfs_server_scraper`, open the crate's
    [settings on crates.io](https://crates.io/crates/cvmfs_server_scraper/settings)
    and add a GitHub publisher under **Trusted Publishing** with these values:
 
