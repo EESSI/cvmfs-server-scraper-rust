@@ -67,8 +67,8 @@
 //!
 //!     for result in scraper.scrape().await {
 //!         match result {
-//!             ScrapedServer::Populated(server) => {
-//!                 println!("{server}");
+//!             ScrapedServer::Collected(server) => {
+//!                 println!("{server}: {:?}", server.repository_outcome());
 //!                 for repository in server.repositories() {
 //!                     println!("{}: revision {}", repository.name(), repository.revision());
 //!                 }
@@ -100,10 +100,12 @@
 //! [`Server::scrape`] for the single-server entry point using [`ScrapeOptions`].
 //!
 //! Configuration and discovery failures produce a [`FailedServer`]. Once
-//! repositories are selected, [`PopulatedServer`] retains successful results and
+//! repositories are selected, [`ServerReport`] retains successful results and
 //! named [`FailedRepository`] errors independently, including at the server deadline.
-//! [`ScrapedServer::is_ok`] requires every selected repository to succeed;
-//! [`ScrapedServer::is_populated`] only indicates that collection was reached.
+//! [`ScrapedServer::Collected`] means a report is available. Its
+//! [`ServerReport::repository_outcome`] distinguishes [`RepositoryOutcome::Complete`],
+//! [`RepositoryOutcome::Partial`], [`RepositoryOutcome::AllFailed`], and
+//! [`RepositoryOutcome::Empty`]. Only a nonempty selection can be complete.
 //! Inspect optional contact metadata and GeoAPI outcomes through [`OptionalFetch`]
 //! and [`GeoapiOutcome`] separately. Missing timestamps remain `None`; present but
 //! unrecognized date strings remain available through [`ReportedTimestamp`].

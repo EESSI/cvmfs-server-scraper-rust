@@ -32,8 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for result in scraper.scrape().await {
         match result {
-            ScrapedServer::Populated(server) => {
-                println!("{server}");
+            ScrapedServer::Collected(server) => {
+                println!("{server}: {:?}", server.repository_outcome());
                 for repo in server.repositories() {
                     println!("{}: revision {}", repo.name(), repo.revision());
                 }
@@ -66,9 +66,18 @@ Applications using `#[tokio::main]` should enable Tokio's `macros` and runtime f
 - `S3` skips index discovery and requires a nonempty effective repository selection.
 - `AutoDetect` uses a valid index when available. Only an HTTP 404 permits an S3 fallback, reported as `BackendResolution::AssumedS3IndexNotFound`. This fallback requires a nonempty effective repository selection; each repository's result is then reported independently. DNS failures, timeouts, malformed indexes, authentication failures, and server errors remain errors.
 
-Configuration and discovery/selection failures produce `ScrapedServer::Failed`. Once repository collection starts, each selected name appears exactly once in either `repositories()` or `failed_repositories()`, each sorted by name. A broken status file or manifest affects only its repository; other repositories continue. Even if all repositories fail, `ScrapedServer::Populated` retains their named errors and any available server metadata. `is_populated()` means collection was reached; `is_ok()` additionally requires every selected repository to have succeeded.
+Configuration and discovery/selection failures produce `ScrapedServer::Failed`. Once repository collection starts, `ScrapedServer::Collected(Box<ServerReport>)` retains a report, including when every repository fails. Each selected name appears exactly once in either `repositories()` or `failed_repositories()`, each sorted by name. A broken status file or manifest affects only its repository; other repositories continue.
 
-Optional contact metadata has `Available`, `Absent` (404), and `Failed` outcomes. GeoAPI has `Available`, `Unsupported`, `Skipped`, and `Failed` outcomes, using the first successful repository in name order. Ancillary failures, including reaching the server deadline, preserve repository results and do not affect `is_ok()`. Inspect these outcomes separately before treating the whole server as healthy.
+Use `ServerReport::repository_outcome()` to inspect the selected repositories:
+
+| `RepositoryOutcome` | Successful repositories | Failed repositories | Meaning |
+| --- | --- | --- | --- |
+| `Complete` | At least one | None | Every selected repository succeeded |
+| `Partial` | At least one | At least one | Preserve successes and handle individual failures |
+| `AllFailed` | None | At least one | Every selected repository failed; named errors remain available |
+| `Empty` | None | None | No repositories were selected; repository availability was not tested |
+
+Optional contact metadata has `Available`, `Absent` (404), and `Failed` outcomes. GeoAPI has `Available`, `Unsupported`, `Skipped`, and `Failed` outcomes, using the first successful repository in name order. Ancillary failures, including reaching the server deadline, preserve repository results and do not change `repository_outcome()`. A `Complete` repository outcome does not establish overall server health; inspect optional probes according to the consumer's policy.
 
 GeoAPI uses one-based IDs. `GeoapiOrdering` validates a complete permutation against its immutable host list. Configure hosts with `GeoapiProbe::Enabled(GeoapiHosts::new(hosts)?)`, or use `GeoapiProbe::Disabled`. Empty lists never silently select default hosts. S3 and Stratum0 servers are not probed.
 
@@ -91,6 +100,8 @@ A validated scraper reuses one HTTP client and global request budget across runs
 A repository job fetches its status and manifest concurrently. Server results retain configuration order; repository results retain name order. The per-server deadline covers discovery, queued request permits, repositories, and ancillary probes, starting when the server is admitted. Request permits cover receiving the entire body and are released on cancellation. Body limits apply to bytes actually received, including chunked responses; Content-Length is also checked early. Configured server count determines the number of bounded batches; there is no separate whole-run deadline.
 
 At that deadline, completed repository and probe results are retained. Active and queued repositories receive named timeout failures; unfinished optional requests receive independent timeout outcomes. No new repository jobs or probes start after the deadline. A deadline during index discovery still produces a failed server because the effective repository selection is not yet known.
+
+Collection continues after individual repository failures within those same limits. This can take longer than failing immediately. `scrape()` returns after all configured servers finish, so additional collection work can delay delivery of healthy servers' results too.
 
 Customize settings through checked newtypes:
 
@@ -128,18 +139,23 @@ These are breaking API changes, grouped together while the crate is pre-1.0:
 | `Server::scrape(repos, ignored, only, geoapi)` | `Server::scrape(ScrapeOptions)`; shares builder validation |
 | `geoapi_servers(...)` | `geoapi(GeoapiProbe::Enabled(GeoapiHosts::new(hosts)?))` |
 | Public populated-server/repository fields | Read-only accessor methods |
+| `ScrapedServer::Populated(Box<PopulatedServer>)` | `ScrapedServer::Collected(Box<ServerReport>)`; a report may contain partial results or no successful repositories |
+| `is_ok()`, `is_failed()`, `is_populated()` | Removed; match `ScrapedServer`, then inspect `ServerReport::repository_outcome()` and optional probes |
+| `as_populated_server()`, `into_populated_server()`, `get_populated_server()` | `as_report()` or `into_report()` retrieves a report regardless of its outcomes |
 | `backend_detected: ServerBackendType` | `backend(): BackendResolution`, including an explicit assumption state |
 | `metadata.administrator` and other contact fields | `contact(): OptionalFetch<ContactMetadata>` |
 | `manifest.s`, `.d`, `.b`, `.n` | `revision()`, `ttl()`, `catalog_size()`, `repository_name()` with typed values |
 | Signed revision integers | `Revision::get(): u64` |
 | Required `manifest.t: i64` | `published_at(): Option<UnixTimestamp>`; `datetime()` checks representability |
-| One repository failure fails the entire server | Successful repositories and named `failed_repositories()` coexist; use `is_ok()` to require all repositories to succeed |
+| One repository failure fails the entire server | Successful repositories and named `failed_repositories()` coexist; require `RepositoryOutcome::Complete` for a nonempty selection with no repository failures |
 | Required history/metadata/reflog hashes | Optional, validated `ContentHash` values |
 | Text signature | `Option<SignatureBytes>`; serialized as bytes, preserving binary data |
 | Zero-based GeoAPI fixtures / directly mutable query vectors | One-based `GeoapiHostId` values in a validated `GeoapiOrdering` |
 | `Option<MaybeRfc2822DateTime>` in scraped models | `Option<ReportedTimestamp>` |
 
 Error enums now retain endpoint context and underlying causes, so consumers matching error variants must update those matches. Serialized repository results nest the requested name, parsed manifest, and identity outcome inside `RepositoryManifest`; consumers of the old repository JSON layout must update their readers.
+
+The result names and generic predicates are changed deliberately so existing callers must choose how to handle partial, failed, and empty collections. `Collected` and `into_report()` indicate the presence of a report, not successful repository fetches. `as_failed_server()` and `into_failed_server()` remain available only for failures before repository collection; an `AllFailed` report is still `Collected` and retains every repository error. Do not treat `as_failed_server().is_none()` as a health check.
 
 ### Configuration and identity
 

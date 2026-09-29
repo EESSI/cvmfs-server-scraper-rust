@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Optional server-supplied contact metadata, without a validation/trust claim.
 /// Read from `cvmfs/info/v1/meta.json`; availability and fetch errors are represented
-/// separately by [`crate::OptionalFetch`] on [`crate::PopulatedServer`].
+/// separately by [`crate::OptionalFetch`] on [`crate::ServerReport`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContactMetadata {
     /// Administrator name or team, as reported by the server.

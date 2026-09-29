@@ -148,10 +148,16 @@ fn options(selection: RepositorySelection) -> ScrapeOptions {
         )
 }
 
-fn populated(result: ScrapedServer) -> PopulatedServer {
-    assert!(result.is_ok(), "repository collection failed: {result:#?}");
+fn complete_report(result: ScrapedServer) -> ServerReport {
     match result {
-        ScrapedServer::Populated(server) => *server,
+        ScrapedServer::Collected(server) => {
+            assert_eq!(
+                server.repository_outcome(),
+                RepositoryOutcome::Complete,
+                "incomplete repository report: {server:#?}"
+            );
+            *server
+        }
         ScrapedServer::Failed(server) => panic!(
             "scrape of {} failed: {:#?}",
             server.server().endpoint(),
@@ -160,7 +166,7 @@ fn populated(result: ScrapedServer) -> PopulatedServer {
     }
 }
 
-fn assert_repositories(server: &PopulatedServer, expected: &[RepositoryName]) {
+fn assert_repositories(server: &ServerReport, expected: &[RepositoryName]) {
     assert_eq!(
         server
             .repositories()
@@ -206,7 +212,7 @@ async fn scrape_all(scraper: &Scraper<ValidatedAndReady>) -> Vec<ScrapedServer> 
     assert_eq!(results.len(), scraper.plan().servers().len());
     for (result, expected) in results.iter().zip(scraper.plan().servers()) {
         let actual = match result {
-            ScrapedServer::Populated(server) => server.server(),
+            ScrapedServer::Collected(server) => server.server(),
             ScrapedServer::Failed(server) => server.server(),
         };
         assert_eq!(actual, expected, "server result order");
@@ -214,11 +220,11 @@ async fn scrape_all(scraper: &Scraper<ValidatedAndReady>) -> Vec<ScrapedServer> 
     results
 }
 
-async fn healthy(scraper: &Scraper<ValidatedAndReady>) -> Vec<PopulatedServer> {
+async fn healthy(scraper: &Scraper<ValidatedAndReady>) -> Vec<ServerReport> {
     let servers: Vec<_> = scrape_all(scraper)
         .await
         .into_iter()
-        .map(populated)
+        .map(complete_report)
         .collect();
     for (server, backend) in servers.iter().zip([
         BackendResolution::DiscoveredCvmfs,
@@ -231,7 +237,7 @@ async fn healthy(scraper: &Scraper<ValidatedAndReady>) -> Vec<PopulatedServer> {
     servers
 }
 
-fn manifest<'a>(server: &'a PopulatedServer, name: &str) -> &'a Manifest {
+fn manifest<'a>(server: &'a ServerReport, name: &str) -> &'a Manifest {
     server
         .repositories()
         .iter()
@@ -241,7 +247,7 @@ fn manifest<'a>(server: &'a PopulatedServer, name: &str) -> &'a Manifest {
         .manifest()
 }
 
-fn assert_same_publication(left: &PopulatedServer, right: &PopulatedServer, name: &str) {
+fn assert_same_publication(left: &ServerReport, right: &ServerReport, name: &str) {
     let left = manifest(left, name);
     let right = manifest(right, name);
     assert_eq!(left.revision(), right.revision(), "{name}: revision");
@@ -309,7 +315,7 @@ async fn testbed_discovery_and_native_metadata(
     } else {
         RepositorySelection::default()
     };
-    let result = populated(
+    let result = complete_report(
         bed.server(service, role, backend)
             .scrape(options(selection))
             .await,
@@ -334,7 +340,7 @@ async fn testbed_repository_selection(#[case] selection: RepositorySelection) {
     let _guard = DEPLOYMENT.lock().await;
     let bed = Testbed::load();
     for (service, role) in [("s0", ServerType::Stratum0), ("s1", ServerType::Stratum1)] {
-        let result = populated(
+        let result = complete_report(
             bed.server(service, role, ServerBackendType::CVMFS)
                 .scrape(options(selection.clone()))
                 .await,
@@ -455,10 +461,10 @@ async fn testbed_failure_isolation_and_recovery(
     let results = scrape_all(&scraper).await;
     for (i, result) in results.into_iter().enumerate() {
         if i == affected {
-            assert!(!result.is_ok(), "outage must fail collection");
             let errors = match &result {
                 ScrapedServer::Failed(server) => vec![server.error()],
-                ScrapedServer::Populated(server) => {
+                ScrapedServer::Collected(server) => {
+                    assert_eq!(server.repository_outcome(), RepositoryOutcome::AllFailed);
                     assert!(server.repositories().is_empty());
                     assert_eq!(server.failed_repositories().len(), 2);
                     server
@@ -499,7 +505,7 @@ async fn testbed_failure_isolation_and_recovery(
                 }
             }
         } else {
-            let server = populated(result);
+            let server = complete_report(result);
             assert_repositories(&server, &names(&[DEV, SOFTWARE]));
             for name in [DEV, SOFTWARE] {
                 assert_same_publication(&before[i], &server, name);

@@ -23,7 +23,8 @@ we reach version 0.1.0, up until then, expect breaking changes.
 - Introduced validated `ServerEndpoint`, `RepositoryName`, manifest scalar/hash types, `RepositorySelection`, immutable `ValidatedScrapePlan`, `RepositoryManifest`, and `GeoapiOrdering`.
 - Populated objects now expose read-only accessors. Server construction takes an explicit HTTP(S) origin, and single-server scraping takes `ScrapeOptions`.
 - Backend resolution and optional probe outcomes use dedicated enums. See the README migration table for API and serialization changes.
-- Repository failures now appear in `PopulatedServer::failed_repositories()`, including when every repository failed. Use `ScrapedServer::is_ok()` for complete repository success; `is_populated()` only indicates that collection was reached. Configuration and discovery failures still produce `FailedServer`.
+- Replaced `ScrapedServer::Populated` / `PopulatedServer` with `Collected(Box<ServerReport>)`. Reports preserve successful repositories and named `failed_repositories()`, even when every repository failed. Configuration and discovery failures still produce `FailedServer`.
+- Removed `ScrapedServer::is_ok()`, `is_failed()`, and `is_populated()`. Match the result enum and inspect `ServerReport::repository_outcome()`: `Complete`, `Partial`, `AllFailed`, or `Empty`. `Complete` requires at least one repository and no repository failures; optional-probe outcomes remain independent. Replace populated-server accessors with `as_report()` or `into_report()`.
 - Replaced default production-network tests with deterministic loopback regressions; public smoke tests are opt-in.
 - Narrowed runtime dependency features, moved test dependencies to dev-dependencies, and added CI linting, caching, bounded jobs and advisory checks.
 

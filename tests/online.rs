@@ -32,10 +32,16 @@ fn options(selection: RepositorySelection) -> ScrapeOptions {
         )
 }
 
-fn populated(result: ScrapedServer) -> PopulatedServer {
-    assert!(result.is_ok(), "repository collection failed: {result:#?}");
+fn complete_report(result: ScrapedServer) -> ServerReport {
     match result {
-        ScrapedServer::Populated(server) => *server,
+        ScrapedServer::Collected(server) => {
+            assert_eq!(
+                server.repository_outcome(),
+                RepositoryOutcome::Complete,
+                "incomplete repository report: {server:#?}"
+            );
+            *server
+        }
         ScrapedServer::Failed(server) => panic!(
             "online scrape of {} failed: {}\n{:#?}",
             server.server().endpoint(),
@@ -45,7 +51,7 @@ fn populated(result: ScrapedServer) -> PopulatedServer {
     }
 }
 
-fn assert_repository_data(server: &PopulatedServer, expected: &[RepositoryName]) {
+fn assert_repository_data(server: &ServerReport, expected: &[RepositoryName]) {
     for name in expected {
         let repository = server
             .repositories()
@@ -91,7 +97,7 @@ fn assert_repository_data(server: &PopulatedServer, expected: &[RepositoryName])
         .all(|pair| pair[0].name() < pair[1].name()));
 }
 
-fn assert_geoapi(server: &PopulatedServer, hosts: &[Hostname]) {
+fn assert_geoapi(server: &ServerReport, hosts: &[Hostname]) {
     let GeoapiOutcome::Available(query) = server.geoapi() else {
         panic!(
             "{}: expected GeoAPI ordering, got {:?}",
@@ -133,7 +139,7 @@ async fn online_stratum1_discovery_metadata_and_geoapi(
     #[case] expected_backend: BackendResolution,
 ) {
     let server = server(origin, ServerType::Stratum1, backend);
-    let result = populated(server.scrape(options(RepositorySelection::default())).await);
+    let result = complete_report(server.scrape(options(RepositorySelection::default())).await);
     assert_eq!(result.backend(), expected_backend);
     assert_repository_data(&result, &names(&EESSI_REPOSITORIES));
     let metadata = result.metadata();
@@ -183,7 +189,7 @@ async fn online_repository_selection_and_custom_geoapi(#[case] selection: Reposi
     let options = options(selection).with_geoapi(GeoapiProbe::Enabled(
         GeoapiHosts::new(hosts.clone()).unwrap(),
     ));
-    let result = populated(server.scrape(options).await);
+    let result = complete_report(server.scrape(options).await);
     assert_repository_data(&result, &names(&["dev.eessi.io", "software.eessi.io"]));
     assert!(!result.has_repository(&"riscv.eessi.io".parse().unwrap()));
     if exact {
@@ -205,7 +211,7 @@ async fn online_s3_repositories_and_backend_resolution(
     #[case] expected_backend: BackendResolution,
 ) {
     let server = server(S3_SYNC, ServerType::SyncServer, backend);
-    let result = populated(
+    let result = complete_report(
         server
             .scrape(options(RepositorySelection::only(names(
                 &EESSI_REPOSITORIES,
@@ -255,7 +261,7 @@ async fn online_mixed_backends_preserve_configuration_order() {
         BackendResolution::DiscoveredCvmfs,
         BackendResolution::ConfiguredS3,
     ]) {
-        let result = populated(result);
+        let result = complete_report(result);
         assert_eq!(result.server(), &server);
         assert_eq!(result.backend(), backend);
         assert_eq!(result.repositories().len(), EESSI_REPOSITORIES.len());
@@ -302,7 +308,7 @@ async fn online_validated_scraper_can_be_reused_across_cycles() {
         let results = scraper.scrape().await;
         assert_eq!(results.len(), targets.len(), "cycle {cycle}");
         for (result, (server, backend)) in results.into_iter().zip(&targets) {
-            let result = populated(result);
+            let result = complete_report(result);
             assert_eq!(result.server(), server, "cycle {cycle}: server order");
             assert_eq!(result.backend(), *backend, "cycle {cycle}: backend");
             assert!(

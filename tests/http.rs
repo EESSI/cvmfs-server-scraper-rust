@@ -37,10 +37,10 @@ async fn repository_failures_preserve_successes_and_continue_queued_work(
         .server(ServerBackendType::CVMFS)
         .scrape(options)
         .await;
-    assert!(!result.is_ok());
-    assert!(!result.is_failed());
-    assert!(result.is_populated());
-    let server = result.into_populated_server().unwrap();
+    assert!(result.as_failed_server().is_none());
+    assert!(result.as_report().is_some());
+    let server = result.into_report().unwrap();
+    assert_eq!(server.repository_outcome(), RepositoryOutcome::Partial);
     assert_eq!(
         server
             .repositories()
@@ -79,8 +79,8 @@ async fn all_repository_failures_remain_visible_and_skip_geoapi() {
         .server(ServerBackendType::CVMFS)
         .scrape(only(&["b.org", "a.org"]).with_geoapi(GeoapiProbe::default()))
         .await;
-    assert!(!result.is_ok());
-    let server = result.into_populated_server().unwrap();
+    let server = result.into_report().unwrap();
+    assert_eq!(server.repository_outcome(), RepositoryOutcome::AllFailed);
     assert!(server.repositories().is_empty());
     assert_eq!(
         server
@@ -131,8 +131,8 @@ async fn optional_deadlines_preserve_repositories_and_completed_probes(
         .await
         .unwrap()
         .unwrap();
-    assert!(result.is_ok());
-    let server = result.into_populated_server().unwrap();
+    let server = result.into_report().unwrap();
+    assert_eq!(server.repository_outcome(), RepositoryOutcome::Complete);
     assert_eq!(server.repositories().len(), 1);
     if stall_contact {
         assert!(
@@ -169,8 +169,8 @@ async fn repository_deadline_preserves_success_and_reports_active_and_queued_nam
                 .with_server_timeout(RequestTimeout::new(Duration::from_millis(500)).unwrap()),
         );
     let result = fixture.server(ServerBackendType::S3).scrape(options).await;
-    assert!(!result.is_ok());
-    let server = result.into_populated_server().unwrap();
+    let server = result.into_report().unwrap();
+    assert_eq!(server.repository_outcome(), RepositoryOutcome::Partial);
     assert_eq!(server.repositories().len(), 1);
     assert_eq!(server.repositories()[0].name().as_str(), "a.org");
     assert_eq!(
@@ -222,15 +222,21 @@ async fn optional_deadline_releases_the_shared_request_permit() {
         .validate()
         .unwrap();
     let first = scraper.scrape().await;
-    assert!(first[0].is_ok());
+    assert_eq!(
+        first[0].as_report().unwrap().repository_outcome(),
+        RepositoryOutcome::Complete
+    );
     assert!(matches!(
-        first[0].as_populated_server().unwrap().contact(),
+        first[0].as_report().unwrap().contact(),
         OptionalFetch::Failed(ScrapeError::Timeout(_))
     ));
     let second = scraper.scrape().await;
-    assert!(second[0].is_ok());
+    assert_eq!(
+        second[0].as_report().unwrap().repository_outcome(),
+        RepositoryOutcome::Complete
+    );
     assert!(matches!(
-        second[0].as_populated_server().unwrap().contact(),
+        second[0].as_report().unwrap().contact(),
         OptionalFetch::Absent
     ));
 }
@@ -255,11 +261,7 @@ async fn forced_only_and_discovery_have_distinct_selection_rules() {
         ))
         .with_geoapi(GeoapiProbe::Disabled);
     let server = fixture.server(ServerBackendType::CVMFS);
-    let populated = server
-        .scrape(options)
-        .await
-        .into_populated_server()
-        .unwrap();
+    let populated = server.scrape(options).await.into_report().unwrap();
     assert_eq!(
         populated
             .repositories()
@@ -271,7 +273,7 @@ async fn forced_only_and_discovery_have_distinct_selection_rules() {
     let populated = server
         .scrape(only(&["excluded.org"]))
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert_eq!(populated.repositories().len(), 1);
     assert_eq!(populated.repositories()[0].name().as_str(), "excluded.org");
@@ -293,14 +295,15 @@ async fn preflight_rejects_empty_effective_s3_selection_and_empty_servers() {
         .server(ServerBackendType::S3)
         .scrape(options)
         .await
-        .is_failed());
+        .as_failed_server()
+        .is_some());
     assert!(Scraper::new().with_servers(vec![]).validate().is_err());
     assert!(fixture.requests.paths().is_empty());
     let populated = fixture
         .server(ServerBackendType::S3)
         .scrape(only(&["example.org"]))
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert_eq!(populated.backend(), BackendResolution::ConfiguredS3);
     assert!(fixture
@@ -342,7 +345,7 @@ async fn autodetection_only_assumes_s3_on_404() {
         .server(ServerBackendType::AutoDetect)
         .scrape(only(&["example.org"]))
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert_eq!(
         populated.backend(),
@@ -352,12 +355,14 @@ async fn autodetection_only_assumes_s3_on_404() {
         .server(ServerBackendType::AutoDetect)
         .scrape(ScrapeOptions::default())
         .await
-        .is_failed());
+        .as_failed_server()
+        .is_some());
     assert!(fixture
         .server(ServerBackendType::CVMFS)
         .scrape(only(&["example.org"]))
         .await
-        .is_failed());
+        .as_failed_server()
+        .is_some());
 }
 #[tokio::test]
 async fn invalid_discovery_names_schemas_counts_and_roles_fail_before_repository_fetches() {
@@ -372,7 +377,8 @@ async fn invalid_discovery_names_schemas_counts_and_roles_fail_before_repository
             .server(ServerBackendType::CVMFS)
             .scrape(ScrapeOptions::default())
             .await
-            .is_failed());
+            .as_failed_server()
+            .is_some());
         assert_eq!(fixture.requests.paths().len(), 1);
     }
     let fixture = Fixture::new(|_| Reply::ok(index(&["a.org", "b.org"]))).await;
@@ -409,7 +415,7 @@ async fn manifest_identity_mismatch_and_malformed_bytes_fail_without_panics() {
             .scrape(only(&["example.org"]))
             .await;
         assert!(matches!(
-            result.as_populated_server().unwrap().failed_repositories()[0].error(),
+            result.as_report().unwrap().failed_repositories()[0].error(),
             CVMFSScraperError::Manifest { .. }
         ));
     }
@@ -429,7 +435,7 @@ async fn scraper_preserves_binary_manifest_signature() {
         .server(ServerBackendType::S3)
         .scrape(only(&["example.org"]))
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert_eq!(
         populated.repositories()[0]
@@ -448,7 +454,7 @@ async fn valid_geoapi_is_mapped_and_invalid_geoapi_preserves_repository_data() {
         .server(ServerBackendType::AutoDetect)
         .scrape(ScrapeOptions::default())
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert_eq!(populated.backend(), BackendResolution::DiscoveredCvmfs);
     let GeoapiOutcome::Available(query) = populated.geoapi() else {
@@ -472,7 +478,7 @@ async fn valid_geoapi_is_mapped_and_invalid_geoapi_preserves_repository_data() {
             .server(ServerBackendType::CVMFS)
             .scrape(ScrapeOptions::default())
             .await
-            .into_populated_server()
+            .into_report()
             .unwrap();
         assert_eq!(populated.repositories().len(), 1);
         assert!(matches!(populated.geoapi(), GeoapiOutcome::Failed(_)));
@@ -493,7 +499,7 @@ async fn optional_metadata_has_distinct_available_absent_and_failed_states() {
             .server(ServerBackendType::S3)
             .scrape(only(&["example.org"]))
             .await
-            .into_populated_server()
+            .into_report()
             .unwrap();
         match (status, populated.contact()) {
             (200, OptionalFetch::Available(metadata)) => {
@@ -516,7 +522,7 @@ async fn optional_metadata_has_distinct_available_absent_and_failed_states() {
         .server(ServerBackendType::S3)
         .scrape(only(&["example.org"]))
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert!(matches!(
         populated.contact(),
@@ -541,7 +547,7 @@ async fn stratum0_and_s3_do_not_probe_geoapi() {
     let populated = server
         .scrape(ScrapeOptions::default())
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert!(matches!(
         populated.geoapi(),
@@ -553,7 +559,7 @@ async fn stratum0_and_s3_do_not_probe_geoapi() {
         .server(ServerBackendType::S3)
         .scrape(options)
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert!(matches!(populated.geoapi(), GeoapiOutcome::Unsupported));
     assert!(!fixture.requests.paths().iter().any(|p| p.contains("/geo/")));
@@ -568,7 +574,10 @@ async fn redirects_never_leave_the_configured_origin() {
             .server(ServerBackendType::S3)
             .scrape(only(&["example.org"]).with_redirects(policy))
             .await;
-        assert!(!result.is_ok());
+        assert_eq!(
+            result.as_report().unwrap().repository_outcome(),
+            RepositoryOutcome::AllFailed
+        );
     }
     assert!(destination.requests.paths().is_empty());
 }
@@ -584,22 +593,33 @@ async fn same_origin_redirects_are_opt_in_and_bounded() {
         }
     })
     .await;
-    assert!(!fixture
-        .server(ServerBackendType::S3)
-        .scrape(only(&["example.org"]))
-        .await
-        .is_ok());
-    assert!(fixture
-        .server(ServerBackendType::S3)
-        .scrape(only(&["example.org"]).with_redirects(RedirectPolicy::SameOrigin))
-        .await
-        .is_ok());
+    assert_eq!(
+        fixture
+            .server(ServerBackendType::S3)
+            .scrape(only(&["example.org"]))
+            .await
+            .into_report()
+            .unwrap()
+            .repository_outcome(),
+        RepositoryOutcome::AllFailed
+    );
+    assert_eq!(
+        fixture
+            .server(ServerBackendType::S3)
+            .scrape(only(&["example.org"]).with_redirects(RedirectPolicy::SameOrigin))
+            .await
+            .into_report()
+            .unwrap()
+            .repository_outcome(),
+        RepositoryOutcome::Complete
+    );
     let looping = Fixture::new(|_| Reply::redirect("/loop")).await;
     assert!(looping
         .server(ServerBackendType::AutoDetect)
         .scrape(ScrapeOptions::default().with_redirects(RedirectPolicy::SameOrigin))
         .await
-        .is_failed());
+        .as_failed_server()
+        .is_some());
     assert!(looping.requests.paths().len() <= 6);
 }
 #[tokio::test]
@@ -611,7 +631,7 @@ async fn response_limits_cover_content_length_chunking_and_truncated_bodies() {
         let fixture = Fixture::new(move |path| if path.ends_with(".cvmfspublished") { Reply::raw(wire.clone()) } else { normal_reply(path) }).await;
         let options = only(&["example.org"]).with_limits(ScrapeLimits::default().with_manifest_bytes(ResponseByteLimit::new(40).unwrap()));
         let result = fixture.server(ServerBackendType::S3).scrape(options).await;
-        assert!(matches!(result.as_populated_server().unwrap().failed_repositories()[0].error(), CVMFSScraperError::Scrape(ScrapeError::BodyTooLarge {limit:40,..})));
+        assert!(matches!(result.as_report().unwrap().failed_repositories()[0].error(), CVMFSScraperError::Scrape(ScrapeError::BodyTooLarge {limit:40,..})));
     }
     let fixture = Fixture::new(|path| {
         if path.ends_with(".cvmfspublished") {
@@ -624,11 +644,16 @@ async fn response_limits_cover_content_length_chunking_and_truncated_bodies() {
         }
     })
     .await;
-    assert!(!fixture
-        .server(ServerBackendType::S3)
-        .scrape(only(&["example.org"]))
-        .await
-        .is_ok());
+    assert_eq!(
+        fixture
+            .server(ServerBackendType::S3)
+            .scrape(only(&["example.org"]))
+            .await
+            .into_report()
+            .unwrap()
+            .repository_outcome(),
+        RepositoryOutcome::AllFailed
+    );
 }
 #[tokio::test]
 async fn stalled_requests_have_request_and_server_deadlines() {
@@ -679,7 +704,7 @@ async fn repository_fetches_are_concurrent_but_respect_the_repository_limit() {
         .iter()
         .all(|p| !p.contains("c.org")));
     gate.add_permits(100);
-    let result = task.await.unwrap().into_populated_server().unwrap();
+    let result = task.await.unwrap().into_report().unwrap();
     assert_eq!(
         result
             .repositories()
@@ -707,7 +732,12 @@ async fn global_request_limit_applies_across_servers() {
     assert_eq!(fixture.requests.paths().len(), 3);
     assert_eq!(fixture.requests.peak(), 3);
     gate.add_permits(100);
-    assert!(task.await.unwrap().iter().all(ScrapedServer::is_populated));
+    for result in task.await.unwrap() {
+        assert_eq!(
+            result.into_report().unwrap().repository_outcome(),
+            RepositoryOutcome::Complete
+        );
+    }
     assert!(fixture.requests.peak() <= 3);
 }
 #[tokio::test]
@@ -732,19 +762,11 @@ async fn server_limit_preserves_input_order() {
     gate.add_permits(100);
     let results = task.await.unwrap();
     assert_eq!(
-        results[0]
-            .as_populated_server()
-            .unwrap()
-            .server()
-            .endpoint(),
+        results[0].as_report().unwrap().server().endpoint(),
         &first.endpoint
     );
     assert_eq!(
-        results[1]
-            .as_populated_server()
-            .unwrap()
-            .server()
-            .endpoint(),
+        results[1].as_report().unwrap().server().endpoint(),
         &second.endpoint
     );
 }
@@ -769,8 +791,20 @@ async fn cancellation_releases_shared_request_permits_for_the_next_run() {
         .with_servers(vec![fixture.server(ServerBackendType::S3)])
         .validate()
         .unwrap();
-    assert!(!scraper.scrape().await[0].is_ok());
-    assert!(scraper.scrape().await[0].is_ok());
+    assert_eq!(
+        scraper.scrape().await[0]
+            .as_report()
+            .unwrap()
+            .repository_outcome(),
+        RepositoryOutcome::AllFailed
+    );
+    assert_eq!(
+        scraper.scrape().await[0]
+            .as_report()
+            .unwrap()
+            .repository_outcome(),
+        RepositoryOutcome::Complete
+    );
 }
 
 #[tokio::test]
@@ -804,7 +838,7 @@ async fn response_limits_apply_to_each_resource_kind() {
         .server(ServerBackendType::CVMFS)
         .scrape(options)
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert!(matches!(
         populated.contact(),
@@ -844,11 +878,13 @@ async fn result_accessors_and_server_metadata_remain_consistent() {
         .server(ServerBackendType::CVMFS)
         .scrape(only(&["example.org"]))
         .await;
-    assert!(result.is_ok());
-    assert!(!result.is_failed());
+    assert_eq!(
+        result.as_report().unwrap().repository_outcome(),
+        RepositoryOutcome::Complete
+    );
     assert!(result.as_failed_server().is_none());
     assert!(result.clone().into_failed_server().is_err());
-    let populated = result.into_populated_server().unwrap();
+    let populated = result.into_report().unwrap();
     assert_eq!(populated.backend(), BackendResolution::ConfiguredCvmfs);
     assert_eq!(populated.metadata().schema_version(), Some(1));
     assert_eq!(populated.metadata().os_id(), Some("rhel"));
@@ -888,9 +924,9 @@ async fn result_accessors_and_server_metadata_remain_consistent() {
         .server(ServerBackendType::S3)
         .scrape(only(&[]))
         .await;
-    assert!(failure.is_failed());
-    assert!(failure.as_populated_server().is_none());
-    assert!(failure.clone().into_populated_server().is_err());
+    assert!(failure.as_failed_server().is_some());
+    assert!(failure.as_report().is_none());
+    assert!(failure.clone().into_report().is_err());
     assert!(failure.into_failed_server().is_ok());
 }
 
@@ -979,8 +1015,11 @@ async fn required_http_failures_do_not_discard_other_servers(
         GeoapiProbe::Disabled
     ));
     let results = scraper.scrape().await;
-    assert!(!results[0].is_ok());
-    let collected = results[0].as_populated_server().unwrap();
+    assert_eq!(
+        results[0].as_report().unwrap().repository_outcome(),
+        RepositoryOutcome::AllFailed
+    );
+    let collected = results[0].as_report().unwrap();
     assert_eq!(collected.server().endpoint(), &failed.endpoint);
     assert!(collected.repositories().is_empty());
     assert_eq!(collected.failed_repositories().len(), 1);
@@ -990,7 +1029,7 @@ async fn required_http_failures_do_not_discard_other_servers(
         matches!(failure.error(), CVMFSScraperError::Scrape(ScrapeError::HttpStatus {status: actual, url})
         if *actual == status && *url == format!("{}cvmfs/example.org/{resource}", failed.endpoint))
     );
-    let populated = results[1].as_populated_server().unwrap();
+    let populated = results[1].as_report().unwrap();
     assert_eq!(populated.server().endpoint(), &healthy.endpoint);
     assert_eq!(populated.repositories().len(), 1);
 }
@@ -1014,7 +1053,7 @@ async fn invalid_required_json_preserves_url_and_source(
     let result = fixture.server(backend).scrape(only(&["example.org"])).await;
     let error = match &result {
         ScrapedServer::Failed(server) => server.error(),
-        ScrapedServer::Populated(server) => server.failed_repositories()[0].error(),
+        ScrapedServer::Collected(server) => server.failed_repositories()[0].error(),
     };
     let CVMFSScraperError::Scrape(ScrapeError::Json { url, source }) = error else {
         panic!("expected JSON error, got {error}");
@@ -1049,7 +1088,10 @@ async fn index_role_validation_applies_to_stratum0_and_sync_servers(
     let server = Server::new(role, ServerBackendType::CVMFS, fixture.endpoint.clone());
     assert_eq!(server.server_type(), role);
     let result = server.scrape(only(&["example.org"])).await;
-    assert_eq!(result.is_ok(), accepted);
+    assert_eq!(
+        result.as_report().map(ServerReport::repository_outcome),
+        accepted.then_some(RepositoryOutcome::Complete)
+    );
     if !accepted {
         assert!(matches!(
             result.as_failed_server().unwrap().error(),
@@ -1066,8 +1108,9 @@ async fn empty_cvmfs_selection_skips_geoapi_without_inventing_a_repository() {
         .server(ServerBackendType::CVMFS)
         .scrape(ScrapeOptions::default().with_selection(RepositorySelection::only([])))
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
+    assert_eq!(populated.repository_outcome(), RepositoryOutcome::Empty);
     assert!(populated.repositories().is_empty());
     assert!(matches!(
         populated.geoapi(),
@@ -1101,7 +1144,7 @@ async fn custom_geoapi_hosts_are_bound_to_the_query_and_response() {
         .scrape()
         .await
         .remove(0)
-        .into_populated_server()
+        .into_report()
         .unwrap();
     let GeoapiOutcome::Available(query) = populated.geoapi() else {
         panic!("expected GeoAPI result")
@@ -1137,7 +1180,7 @@ async fn geoapi_transport_and_encoding_failures_preserve_repositories(#[case] re
         .server(ServerBackendType::CVMFS)
         .scrape(ScrapeOptions::default())
         .await
-        .into_populated_server()
+        .into_report()
         .unwrap();
     assert_eq!(populated.repositories().len(), 1);
     let GeoapiOutcome::Failed(error) = populated.geoapi() else {
@@ -1166,9 +1209,14 @@ async fn manifest_body_exactly_at_the_limit_is_accepted(#[case] chunked: bool) {
     let options = only(&["example.org"]).with_limits(
         ScrapeLimits::default().with_manifest_bytes(ResponseByteLimit::new(limit).unwrap()),
     );
-    assert!(fixture
-        .server(ServerBackendType::S3)
-        .scrape(options)
-        .await
-        .is_ok());
+    assert_eq!(
+        fixture
+            .server(ServerBackendType::S3)
+            .scrape(options)
+            .await
+            .into_report()
+            .unwrap()
+            .repository_outcome(),
+        RepositoryOutcome::Complete
+    );
 }

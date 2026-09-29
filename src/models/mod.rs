@@ -19,5 +19,6 @@ pub use manifest_values::{
 pub use meta_json::ContactMetadata;
 pub use servers::{
     BackendResolution, FailedRepository, FailedServer, OptionalFetch, PopulatedRepositoryOrReplica,
-    PopulatedServer, ScrapedServer, Server, ServerBackendType, ServerMetadata, ServerType,
+    RepositoryOutcome, ScrapedServer, Server, ServerBackendType, ServerMetadata, ServerReport,
+    ServerType,
 };

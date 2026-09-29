@@ -128,7 +128,7 @@ impl Server {
     pub fn server_type(&self) -> ServerType {
         self.server_type
     }
-    /// Requested backend policy; see [`PopulatedServer::backend`] for the outcome.
+    /// Requested backend policy; see [`ServerReport::backend`] for the outcome.
     pub fn backend_type(&self) -> ServerBackendType {
         self.backend_type
     }
@@ -153,7 +153,7 @@ impl Server {
     /// contact metadata and GeoAPI results. Options control selection, probe hosts,
     /// deadlines, response sizes, and concurrency. Configuration and discovery
     /// errors produce [`ScrapedServer::Failed`]; repository and optional-probe
-    /// failures are retained in [`PopulatedServer`]. Each call creates a new client; use a
+    /// failures are retained in [`ServerReport`]. Each call creates a new client; use a
     /// validated [`Scraper`] when the connection pool should be reused across calls.
     ///
     /// ```no_run
@@ -189,7 +189,7 @@ impl Server {
         log::debug!("Scraping {}", self.endpoint);
         let deadline = Instant::now() + options.limits().server_timeout().get();
         match self.try_scrape(client, options, deadline).await {
-            Ok(server) => ScrapedServer::Populated(Box::new(server)),
+            Ok(server) => ScrapedServer::Collected(Box::new(server)),
             Err(error) => self.failed(error),
         }
     }
@@ -198,7 +198,7 @@ impl Server {
         client: &ScrapeClient,
         options: &ScrapeOptions,
         deadline: Instant,
-    ) -> Result<PopulatedServer, CVMFSScraperError> {
+    ) -> Result<ServerReport, CVMFSScraperError> {
         let (backend, index) = match self.backend_type {
             ServerBackendType::S3 => (BackendResolution::ConfiguredS3, None),
             ServerBackendType::CVMFS | ServerBackendType::AutoDetect => {
@@ -299,7 +299,7 @@ impl Server {
             contact_future,
             self.fetch_geoapi(client, options, backend, repositories.first(), deadline)
         );
-        Ok(PopulatedServer {
+        Ok(ServerReport {
             server: self.clone(),
             backend,
             repositories,
@@ -424,9 +424,28 @@ pub enum OptionalFetch<T> {
     Failed(ScrapeError),
 }
 
+/// Repository collection outcome, independent of contact metadata and GeoAPI.
+///
+/// Obtained from [`ServerReport::repository_outcome`]. Configuration and
+/// discovery failures instead produce [`ScrapedServer::Failed`] without a report.
+/// This enum does not describe the overall health of a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryOutcome {
+    /// At least one repository was selected, and every selected repository succeeded.
+    Complete,
+    /// Some selected repositories succeeded and some failed.
+    Partial,
+    /// At least one repository was selected, and every selected repository failed.
+    AllFailed,
+    /// The effective selection contained no repositories; none were fetched.
+    Empty,
+}
+
 /// Read-only results after successful discovery/selection, including repository
-/// failures. Inspect [`Self::failed_repositories`] and ancillary contact/GeoAPI
-/// outcomes before treating the whole server as healthy.
+/// failures. Inspect [`Self::repository_outcome`] and ancillary contact/GeoAPI
+/// outcomes before treating the whole server as healthy. A report can contain
+/// zero successful repositories; [`RepositoryOutcome::Empty`] distinguishes an
+/// empty selection from [`RepositoryOutcome::AllFailed`].
 ///
 /// Created only by a completed scrape. Primary repositories and replicas share
 /// [`Self::repositories`], sorted by name. The configured role determines which
@@ -434,7 +453,7 @@ pub enum OptionalFetch<T> {
 /// [`Self::contact`] independently describes the optional `meta.json` fetch.
 /// Index metadata is absent on S3, but contact metadata is still requested.
 #[derive(Debug, Clone)]
-pub struct PopulatedServer {
+pub struct ServerReport {
     server: Server,
     backend: BackendResolution,
     repositories: Vec<PopulatedRepositoryOrReplica>,
@@ -443,7 +462,34 @@ pub struct PopulatedServer {
     contact: OptionalFetch<ContactMetadata>,
     geoapi: GeoapiOutcome,
 }
-impl PopulatedServer {
+impl ServerReport {
+    /// Summarize the selected repositories, including failures and timeouts.
+    /// Computed from the immutable results so it cannot disagree with them.
+    /// Optional-probe outcomes do not affect this value.
+    ///
+    /// ```
+    /// use cvmfs_server_scraper::{RepositoryOutcome, ServerReport};
+    ///
+    /// fn describe(report: &ServerReport) -> &'static str {
+    ///     match report.repository_outcome() {
+    ///         RepositoryOutcome::Complete => "Every selected repository succeeded",
+    ///         RepositoryOutcome::Partial => "Some repositories failed; successes remain available",
+    ///         RepositoryOutcome::AllFailed => "Every selected repository failed",
+    ///         RepositoryOutcome::Empty => "No repositories were selected",
+    ///     }
+    /// }
+    /// ```
+    pub fn repository_outcome(&self) -> RepositoryOutcome {
+        match (
+            self.repositories.is_empty(),
+            self.failed_repositories.is_empty(),
+        ) {
+            (false, true) => RepositoryOutcome::Complete,
+            (false, false) => RepositoryOutcome::Partial,
+            (true, false) => RepositoryOutcome::AllFailed,
+            (true, true) => RepositoryOutcome::Empty,
+        }
+    }
     /// Original server configuration, including the requested backend policy.
     pub fn server(&self) -> &Server {
         &self.server
@@ -486,7 +532,7 @@ impl PopulatedServer {
         println!("{self:#?}");
     }
 }
-impl std::fmt::Display for PopulatedServer {
+impl std::fmt::Display for ServerReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -498,7 +544,7 @@ impl std::fmt::Display for PopulatedServer {
 
 /// A failed configuration or discovery/selection step with the original server
 /// configuration and its error. Once repositories are selected, their failures
-/// and timeouts stay on [`PopulatedServer`], alongside any successful results.
+/// and timeouts stay on [`ServerReport`], alongside any successful results.
 #[derive(Debug, Clone)]
 pub struct FailedServer {
     server: Server,
@@ -516,44 +562,38 @@ impl FailedServer {
     }
 }
 /// Result of scraping one configured server.
+///
+/// `Collected` means a report is available, including when every selected
+/// repository failed. Match this enum, then inspect
+/// [`ServerReport::repository_outcome`] and the optional-probe outcomes separately.
 #[derive(Debug, Clone)]
 pub enum ScrapedServer {
     /// Discovery/selection succeeded. Repository and ancillary failures are
     /// retained alongside successes, even when every selected repository failed.
-    Populated(Box<PopulatedServer>),
+    Collected(Box<ServerReport>),
     /// Configuration or discovery/selection failed before repository collection.
     Failed(FailedServer),
 }
 impl ScrapedServer {
-    /// Whether configuration or discovery/selection failed before collection.
-    /// Use `!self.is_ok()` to also detect repository failures.
-    pub fn is_failed(&self) -> bool {
-        matches!(self, Self::Failed(_))
-    }
-    /// Whether repository collection was reached; does not imply full success.
-    pub fn is_populated(&self) -> bool {
-        matches!(self, Self::Populated(_))
-    }
-    /// Whether discovery/selection and every selected repository succeeded.
-    /// Optional-probe failures do not affect this value.
-    pub fn is_ok(&self) -> bool {
-        matches!(self, Self::Populated(server) if server.failed_repositories.is_empty())
-    }
-    pub fn as_populated_server(&self) -> Option<&PopulatedServer> {
+    /// Borrow the collection report, regardless of its repository/probe outcomes.
+    pub fn as_report(&self) -> Option<&ServerReport> {
         match self {
-            Self::Populated(value) => Some(value),
+            Self::Collected(value) => Some(value),
             _ => None,
         }
     }
+    /// Borrow a failure that prevented repository collection.
     pub fn as_failed_server(&self) -> Option<&FailedServer> {
         match self {
             Self::Failed(value) => Some(value),
             _ => None,
         }
     }
-    pub fn into_populated_server(self) -> Result<PopulatedServer, GenericError> {
+    /// Extract the collection report. `Ok` means a report exists, not that its
+    /// repositories or optional probes all succeeded; inspect their outcomes.
+    pub fn into_report(self) -> Result<ServerReport, GenericError> {
         match self {
-            Self::Populated(value) => Ok(*value),
+            Self::Collected(value) => Ok(*value),
             Self::Failed(value) => Err(GenericError::TypeError(format!(
                 "{}: {}",
                 value.hostname(),
@@ -564,14 +604,11 @@ impl ScrapedServer {
     pub fn into_failed_server(self) -> Result<FailedServer, GenericError> {
         match self {
             Self::Failed(value) => Ok(value),
-            Self::Populated(value) => Err(GenericError::TypeError(format!(
-                "{} is a populated server",
+            Self::Collected(value) => Err(GenericError::TypeError(format!(
+                "{} has a collection report",
                 value.hostname()
             ))),
         }
-    }
-    pub fn get_populated_server(self) -> Result<PopulatedServer, GenericError> {
-        self.into_populated_server()
     }
     pub fn get_failed_server(self) -> Result<FailedServer, GenericError> {
         self.into_failed_server()
@@ -598,7 +635,7 @@ impl FailedRepository {
 /// Fields are optional because an S3 backend has no index and CVMFS servers may
 /// omit version or OS details, including for privacy reasons. The schema is present
 /// for a successfully validated CVMFS index. Contact information from `meta.json`
-/// is kept separately in [`PopulatedServer::contact`].
+/// is kept separately in [`ServerReport::contact`].
 #[derive(Debug, Clone, PartialEq, Serialize, Default)]
 pub struct ServerMetadata {
     schema_version: Option<u32>,
