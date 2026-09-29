@@ -2,12 +2,15 @@ use crate::models::{cvmfs_status_json::StatusJSON, repositories_json::Repositori
 use crate::transport::ScrapeClient;
 use crate::utilities::generate_random_string;
 use crate::{
-    CVMFSScraperError, ContactMetadata, GenericError, GeoapiOrdering, GeoapiOutcome, GeoapiProbe,
-    GeoapiServerQuery, GeoapiSkipReason, Manifest, ReportedTimestamp, RepositoryManifest,
-    RepositoryName, Revision, ScrapeError, ScrapeOptions, Scraper, ScraperCommon, ServerEndpoint,
+    CVMFSScraperError, ConfigurationError, ContactMetadata, GenericError, GeoapiOrdering,
+    GeoapiOutcome, GeoapiProbe, GeoapiServerQuery, GeoapiSkipReason, Hostname, Manifest,
+    ReportedTimestamp, RepositoryManifest, RepositoryName, Revision, ScrapeError, ScrapeOptions,
+    Scraper, ScraperCommon, ServerEndpoint,
 };
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use tokio::time::{timeout_at, Instant};
 
 /// Server role used to check whether a CVMFS index contains primaries or replicas.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy)]
@@ -57,13 +60,57 @@ impl BackendResolution {
 /// [`ScrapedServer`] containing either read-only results or the original
 /// configuration together with an error. Use [`Scraper`] to share a connection
 /// pool and request budget across multiple servers or repeated runs.
+/// JSON accepts either `endpoint` or legacy `hostname` (converted to HTTP), but
+/// not both. Serialization always emits the canonical `endpoint` form.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(try_from = "ServerConfig")]
 pub struct Server {
     server_type: ServerType,
-    #[serde(default)]
     backend_type: ServerBackendType,
     endpoint: ServerEndpoint,
 }
+
+#[derive(Deserialize)]
+struct ServerConfig {
+    server_type: ServerType,
+    #[serde(default)]
+    backend_type: ServerBackendType,
+    endpoint: Option<ServerEndpoint>,
+    hostname: Option<Hostname>,
+}
+impl TryFrom<ServerConfig> for Server {
+    type Error = ConfigurationError;
+
+    fn try_from(config: ServerConfig) -> Result<Self, Self::Error> {
+        let endpoint = match (config.endpoint, config.hostname) {
+            (Some(endpoint), None) => endpoint,
+            (None, Some(hostname)) => format!("http://{hostname}").parse()?,
+            _ => {
+                return Err(ConfigurationError {
+                    field: "server address",
+                    reason: "specify exactly one of endpoint or legacy hostname".into(),
+                })
+            }
+        };
+        Ok(Self::new(config.server_type, config.backend_type, endpoint))
+    }
+}
+
+// Every stage shares the server's absolute deadline. Check before polling so
+// queued repositories and probes cannot start requests after it has expired.
+async fn before_deadline<T, E: From<ScrapeError>>(
+    deadline: Instant,
+    context: &str,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    if Instant::now() >= deadline {
+        return Err(ScrapeError::Timeout(context.into()).into());
+    }
+    timeout_at(deadline, future)
+        .await
+        .unwrap_or_else(|_| Err(ScrapeError::Timeout(context.into()).into()))
+}
+
 impl Server {
     /// Combine a server role and backend policy with a validated endpoint.
     pub fn new(
@@ -104,9 +151,9 @@ impl Server {
     ///
     /// Fetches the selected repositories' status files and manifests, plus optional
     /// contact metadata and GeoAPI results. Options control selection, probe hosts,
-    /// deadlines, response sizes, and concurrency. Configuration and required-resource
-    /// errors produce [`ScrapedServer::Failed`]; optional failures are retained in
-    /// the successful [`PopulatedServer`]. Each call creates a new client; use a
+    /// deadlines, response sizes, and concurrency. Configuration and discovery
+    /// errors produce [`ScrapedServer::Failed`]; repository and optional-probe
+    /// failures are retained in [`PopulatedServer`]. Each call creates a new client; use a
     /// validated [`Scraper`] when the connection pool should be reused across calls.
     ///
     /// ```no_run
@@ -140,28 +187,27 @@ impl Server {
         options: &ScrapeOptions,
     ) -> ScrapedServer {
         log::debug!("Scraping {}", self.endpoint);
-        match tokio::time::timeout(
-            options.limits().server_timeout().get(),
-            self.try_scrape(client, options),
-        )
-        .await
-        {
-            Ok(Ok(server)) => ScrapedServer::Populated(Box::new(server)),
-            Ok(Err(error)) => self.failed(error),
-            Err(_) => self.failed(ScrapeError::Timeout(self.endpoint.to_string()).into()),
+        let deadline = Instant::now() + options.limits().server_timeout().get();
+        match self.try_scrape(client, options, deadline).await {
+            Ok(server) => ScrapedServer::Populated(Box::new(server)),
+            Err(error) => self.failed(error),
         }
     }
     async fn try_scrape(
         &self,
         client: &ScrapeClient,
         options: &ScrapeOptions,
+        deadline: Instant,
     ) -> Result<PopulatedServer, CVMFSScraperError> {
         let (backend, index) = match self.backend_type {
             ServerBackendType::S3 => (BackendResolution::ConfiguredS3, None),
             ServerBackendType::CVMFS | ServerBackendType::AutoDetect => {
-                match client
-                    .json::<RepositoriesJSON>(&self.endpoint.index())
-                    .await
+                match before_deadline(
+                    deadline,
+                    &self.endpoint.to_string(),
+                    client.json::<RepositoriesJSON>(&self.endpoint.index()),
+                )
+                .await
                 {
                     Ok(index) => {
                         self.validate_index(&index, options)?;
@@ -214,16 +260,35 @@ impl Server {
         if backend.is_s3() && names.is_empty() {
             return Err(ScrapeError::EmptyRepositoryList(self.endpoint.to_string()).into());
         }
-        let mut repositories = stream::iter(names)
-            .map(|name| async move { self.scrape_repository(client, &name).await })
-            .buffer_unordered(options.limits().repositories().get())
-            .try_collect::<Vec<_>>()
-            .await?;
+        let mut jobs = stream::iter(names)
+            .map(|name| async move {
+                let result = before_deadline(
+                    deadline,
+                    &self.endpoint.to_string(),
+                    self.scrape_repository(client, &name),
+                )
+                .await;
+                result.map_err(|error| FailedRepository { name, error })
+            })
+            .buffer_unordered(options.limits().repositories().get());
+        let mut repositories = Vec::new();
+        let mut failed_repositories = Vec::new();
+        while let Some(result) = jobs.next().await {
+            match result {
+                Ok(repository) => repositories.push(repository),
+                Err(failure) => failed_repositories.push(failure),
+            }
+        }
         repositories.sort_unstable_by(|a, b| a.name().cmp(b.name()));
+        failed_repositories.sort_unstable_by(|a, b| a.name().cmp(b.name()));
         let contact_future = async {
-            match client
-                .json::<ContactMetadata>(&self.endpoint.metadata())
-                .await
+            let endpoint = self.endpoint.metadata();
+            match before_deadline(
+                deadline,
+                endpoint.url().as_str(),
+                client.json::<ContactMetadata>(&endpoint),
+            )
+            .await
             {
                 Ok(value) => OptionalFetch::Available(value),
                 Err(error) if error.is_not_found() => OptionalFetch::Absent,
@@ -232,12 +297,13 @@ impl Server {
         };
         let (contact, geoapi) = futures::join!(
             contact_future,
-            self.fetch_geoapi(client, options, backend, repositories.first())
+            self.fetch_geoapi(client, options, backend, repositories.first(), deadline)
         );
         Ok(PopulatedServer {
             server: self.clone(),
             backend,
             repositories,
+            failed_repositories,
             metadata,
             contact,
             geoapi,
@@ -312,6 +378,7 @@ impl Server {
         options: &ScrapeOptions,
         backend: BackendResolution,
         repository: Option<&PopulatedRepositoryOrReplica>,
+        deadline: Instant,
     ) -> GeoapiOutcome {
         let hosts = match options.geoapi() {
             GeoapiProbe::Disabled => return GeoapiOutcome::Skipped(GeoapiSkipReason::Disabled),
@@ -330,14 +397,14 @@ impl Server {
             .endpoint
             .repository(repository.name())
             .geoapi(&generate_random_string(12), hosts.as_slice());
-        let result = async {
+        let result = before_deadline(deadline, endpoint.url().as_str(), async {
             let bytes = client.bytes(&endpoint).await?;
             let text = std::str::from_utf8(&bytes)
                 .map_err(|e| ScrapeError::GeoAPIFailure(format!("{}: {e}", endpoint.url())))?;
             let ordering = GeoapiOrdering::from_response(hosts.as_slice().to_vec(), text)
                 .map_err(|e| ScrapeError::GeoAPIFailure(format!("{}: {e}", endpoint.url())))?;
             Ok(GeoapiServerQuery::new(self.endpoint.clone(), ordering))
-        }
+        })
         .await;
         match result {
             Ok(query) => GeoapiOutcome::Available(query),
@@ -357,7 +424,8 @@ pub enum OptionalFetch<T> {
     Failed(ScrapeError),
 }
 
-/// Read-only result of the required fetches. Inspect ancillary contact/GeoAPI
+/// Read-only results after successful discovery/selection, including repository
+/// failures. Inspect [`Self::failed_repositories`] and ancillary contact/GeoAPI
 /// outcomes before treating the whole server as healthy.
 ///
 /// Created only by a completed scrape. Primary repositories and replicas share
@@ -370,6 +438,7 @@ pub struct PopulatedServer {
     server: Server,
     backend: BackendResolution,
     repositories: Vec<PopulatedRepositoryOrReplica>,
+    failed_repositories: Vec<FailedRepository>,
     metadata: ServerMetadata,
     contact: OptionalFetch<ContactMetadata>,
     geoapi: GeoapiOutcome,
@@ -390,6 +459,12 @@ impl PopulatedServer {
     /// Successful repository/replica results in lexical name order.
     pub fn repositories(&self) -> &[PopulatedRepositoryOrReplica] {
         &self.repositories
+    }
+    /// Failed repository/replica results in lexical name order. Together with
+    /// [`Self::repositories`], accounts for every selected name exactly once.
+    /// Includes queued and active repositories that reached the server deadline.
+    pub fn failed_repositories(&self) -> &[FailedRepository] {
+        &self.failed_repositories
     }
     /// Metadata obtained from the repository index, if this backend supplied one.
     pub fn metadata(&self) -> &ServerMetadata {
@@ -421,9 +496,9 @@ impl std::fmt::Display for PopulatedServer {
     }
 }
 
-/// A failed scrape with the original server configuration and its error.
-/// Configuration failures, required-resource failures, and server deadlines all
-/// use this type. Optional probe failures stay on [`PopulatedServer`] instead.
+/// A failed configuration or discovery/selection step with the original server
+/// configuration and its error. Once repositories are selected, their failures
+/// and timeouts stay on [`PopulatedServer`], alongside any successful results.
 #[derive(Debug, Clone)]
 pub struct FailedServer {
     server: Server,
@@ -443,20 +518,26 @@ impl FailedServer {
 /// Result of scraping one configured server.
 #[derive(Debug, Clone)]
 pub enum ScrapedServer {
-    /// All selected repositories succeeded; ancillary probes may still have failed.
+    /// Discovery/selection succeeded. Repository and ancillary failures are
+    /// retained alongside successes, even when every selected repository failed.
     Populated(Box<PopulatedServer>),
-    /// The configuration or a required part of the scrape failed.
+    /// Configuration or discovery/selection failed before repository collection.
     Failed(FailedServer),
 }
 impl ScrapedServer {
+    /// Whether configuration or discovery/selection failed before collection.
+    /// Use `!self.is_ok()` to also detect repository failures.
     pub fn is_failed(&self) -> bool {
         matches!(self, Self::Failed(_))
     }
+    /// Whether repository collection was reached; does not imply full success.
     pub fn is_populated(&self) -> bool {
         matches!(self, Self::Populated(_))
     }
+    /// Whether discovery/selection and every selected repository succeeded.
+    /// Optional-probe failures do not affect this value.
     pub fn is_ok(&self) -> bool {
-        self.is_populated()
+        matches!(self, Self::Populated(server) if server.failed_repositories.is_empty())
     }
     pub fn as_populated_server(&self) -> Option<&PopulatedServer> {
         match self {
@@ -494,6 +575,21 @@ impl ScrapedServer {
     }
     pub fn get_failed_server(self) -> Result<FailedServer, GenericError> {
         self.into_failed_server()
+    }
+}
+
+/// Failure of one selected repository. Other repositories continue independently.
+#[derive(Debug, Clone)]
+pub struct FailedRepository {
+    name: RepositoryName,
+    error: CVMFSScraperError,
+}
+impl FailedRepository {
+    pub fn name(&self) -> &RepositoryName {
+        &self.name
+    }
+    pub fn error(&self) -> &CVMFSScraperError {
+        &self.error
     }
 }
 

@@ -121,8 +121,9 @@ impl Default for GeoapiProbe {
     }
 }
 
-/// Required repository failures fail the server. Optional metadata and GeoAPI
-/// failures are preserved in their own outcomes without discarding repository data.
+/// Repository failures are retained by name alongside successful repositories.
+/// Optional metadata and GeoAPI failures have independent outcomes. Completed
+/// results survive the server deadline.
 ///
 /// Defaults discover all repositories, enable the default GeoAPI hosts, apply
 /// [`ScrapeLimits::default`], and disable redirects. Use these options with either
@@ -362,9 +363,10 @@ impl Scraper<ValidatedAndReady> {
     /// Results retain input server order. Each server has its own total deadline;
     /// request permits are shared across all servers and released on cancellation.
     ///
-    /// Returns one [`ScrapedServer`] per configured server. A required-resource
-    /// failure affects that server; other servers continue. Optional contact and
-    /// GeoAPI failures remain available on successful results. The deadline starts
+    /// Returns one [`ScrapedServer`] per configured server. Discovery failures
+    /// affect that server; repository failures affect only that repository.
+    /// Completed results survive the deadline, with named errors for unfinished
+    /// repositories and independent optional contact/GeoAPI outcomes. The deadline starts
     /// when a server is admitted by the concurrency limit, not while it waits for
     /// admission. There is no separate whole-run deadline.
     pub async fn scrape(&self) -> Vec<ScrapedServer> {

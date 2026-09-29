@@ -33,6 +33,7 @@ fn options(selection: RepositorySelection) -> ScrapeOptions {
 }
 
 fn populated(result: ScrapedServer) -> PopulatedServer {
+    assert!(result.is_ok(), "repository collection failed: {result:#?}");
     match result {
         ScrapedServer::Populated(server) => *server,
         ScrapedServer::Failed(server) => panic!(

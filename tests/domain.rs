@@ -103,6 +103,42 @@ fn endpoints_support_explicit_ports_tls_and_ipv6(#[case] text: &str, #[case] hos
         endpoint
     );
 }
+#[rstest]
+#[case::legacy(json!({"hostname": "EXAMPLE.org"}), "http://example.org/")]
+#[case::endpoint(json!({"endpoint": "https://example.org:8443"}), "https://example.org:8443/")]
+fn server_configuration_accepts_legacy_and_explicit_addresses(
+    #[case] mut config: serde_json::Value,
+    #[case] endpoint: &str,
+) {
+    config["server_type"] = json!("Stratum1");
+    let server: Server = serde_json::from_value(config.clone()).unwrap();
+    assert_eq!(server.endpoint().to_string(), endpoint);
+    assert_eq!(server.hostname(), "example.org");
+    assert_eq!(server.backend_type(), ServerBackendType::AutoDetect);
+    config["backend_type"] = json!("S3");
+    let explicit: Server = serde_json::from_str(&config.to_string()).unwrap();
+    assert_eq!(explicit.backend_type(), ServerBackendType::S3);
+    let canonical = serde_json::to_value(&server).unwrap();
+    assert_eq!(canonical["endpoint"], endpoint);
+    assert!(canonical.get("hostname").is_none());
+    assert_eq!(serde_json::from_value::<Server>(canonical).unwrap(), server);
+}
+
+#[rstest]
+#[case::both(json!({"hostname":"example.org", "endpoint":"http://example.org"}))]
+#[case::missing(json!({}))]
+#[case::hostname_with_scheme(json!({"hostname":"https://example.org"}))]
+#[case::hostname_with_port(json!({"hostname":"example.org:8443"}))]
+#[case::invalid_hostname(json!({"hostname":"bad..example"}))]
+#[case::invalid_endpoint(json!({"endpoint":"example.org"}))]
+#[case::no_fallback_from_invalid_endpoint(json!({"hostname":"example.org", "endpoint":"invalid"}))]
+fn server_configuration_rejects_ambiguous_or_invalid_addresses(
+    #[case] mut config: serde_json::Value,
+) {
+    config["server_type"] = json!("Stratum1");
+    assert!(serde_json::from_value::<Server>(config).is_err());
+}
+
 #[test]
 fn malformed_manifest_input_returns_errors_without_panicking() {
     for input in [

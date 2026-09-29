@@ -37,6 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for repo in server.repositories() {
                     println!("{}: revision {}", repo.name(), repo.revision());
                 }
+                for failure in server.failed_repositories() {
+                    eprintln!("{}: {}", failure.name(), failure.error());
+                }
                 if let GeoapiOutcome::Failed(error) = server.geoapi() {
                     eprintln!("GeoAPI: {error}");
                 }
@@ -61,9 +64,11 @@ Applications using `#[tokio::main]` should enable Tokio's `macros` and runtime f
 
 - `CVMFS` requires a valid schema-1 repository index consistent with the configured server role.
 - `S3` skips index discovery and requires a nonempty effective repository selection.
-- `AutoDetect` uses a valid index when available. Only an HTTP 404 permits an S3 fallback, reported as `BackendResolution::AssumedS3IndexNotFound`. This fallback also requires repositories to scrape successfully. DNS failures, timeouts, malformed indexes, authentication failures, and server errors remain errors.
+- `AutoDetect` uses a valid index when available. Only an HTTP 404 permits an S3 fallback, reported as `BackendResolution::AssumedS3IndexNotFound`. This fallback requires a nonempty effective repository selection; each repository's result is then reported independently. DNS failures, timeouts, malformed indexes, authentication failures, and server errors remain errors.
 
-A required repository status/manifest failure fails that server and cancels its unfinished requests. Other servers continue. Optional contact metadata has `Available`, `Absent` (404), and `Failed` outcomes. GeoAPI has `Available`, `Unsupported`, `Skipped`, and `Failed` outcomes. Ancillary failures preserve repository results; `is_populated()` and `is_ok()` mean required resources succeeded, so inspect ancillary outcomes separately.
+Configuration and discovery/selection failures produce `ScrapedServer::Failed`. Once repository collection starts, each selected name appears exactly once in either `repositories()` or `failed_repositories()`, each sorted by name. A broken status file or manifest affects only its repository; other repositories continue. Even if all repositories fail, `ScrapedServer::Populated` retains their named errors and any available server metadata. `is_populated()` means collection was reached; `is_ok()` additionally requires every selected repository to have succeeded.
+
+Optional contact metadata has `Available`, `Absent` (404), and `Failed` outcomes. GeoAPI has `Available`, `Unsupported`, `Skipped`, and `Failed` outcomes, using the first successful repository in name order. Ancillary failures, including reaching the server deadline, preserve repository results and do not affect `is_ok()`. Inspect these outcomes separately before treating the whole server as healthy.
 
 GeoAPI uses one-based IDs. `GeoapiOrdering` validates a complete permutation against its immutable host list. Configure hosts with `GeoapiProbe::Enabled(GeoapiHosts::new(hosts)?)`, or use `GeoapiProbe::Disabled`. Empty lists never silently select default hosts. S3 and Stratum0 servers are not probed.
 
@@ -84,6 +89,8 @@ A validated scraper reuses one HTTP client and global request budget across runs
 | Repository count per server | 10,000 |
 
 A repository job fetches its status and manifest concurrently. Server results retain configuration order; repository results retain name order. The per-server deadline covers discovery, queued request permits, repositories, and ancillary probes, starting when the server is admitted. Request permits cover receiving the entire body and are released on cancellation. Body limits apply to bytes actually received, including chunked responses; Content-Length is also checked early. Configured server count determines the number of bounded batches; there is no separate whole-run deadline.
+
+At that deadline, completed repository and probe results are retained. Active and queued repositories receive named timeout failures; unfinished optional requests receive independent timeout outcomes. No new repository jobs or probes start after the deadline. A deadline during index discovery still produces a failed server because the effective repository selection is not yet known.
 
 Customize settings through checked newtypes:
 
@@ -116,7 +123,7 @@ These are breaking API changes, grouped together while the crate is pre-1.0:
 
 | Previously | Now |
 | --- | --- |
-| `Server::new(..., Hostname)` / JSON `hostname` | `Server::new(..., ServerEndpoint)` / JSON `endpoint` containing an HTTP(S) origin |
+| `Server::new(..., Hostname)` / JSON `hostname` | Constructor takes `ServerEndpoint`; JSON accepts legacy `hostname` or an explicit HTTP(S) `endpoint` and serializes as `endpoint` |
 | Forced/ignored lists plus `only_scrape_forced_repositories(bool)` | `RepositorySelection::only(...)` or `::discover(include, exclude)`, containing `RepositoryName` values |
 | `Server::scrape(repos, ignored, only, geoapi)` | `Server::scrape(ScrapeOptions)`; shares builder validation |
 | `geoapi_servers(...)` | `geoapi(GeoapiProbe::Enabled(GeoapiHosts::new(hosts)?))` |
@@ -125,12 +132,42 @@ These are breaking API changes, grouped together while the crate is pre-1.0:
 | `metadata.administrator` and other contact fields | `contact(): OptionalFetch<ContactMetadata>` |
 | `manifest.s`, `.d`, `.b`, `.n` | `revision()`, `ttl()`, `catalog_size()`, `repository_name()` with typed values |
 | Signed revision integers | `Revision::get(): u64` |
+| Required `manifest.t: i64` | `published_at(): Option<UnixTimestamp>`; `datetime()` checks representability |
+| One repository failure fails the entire server | Successful repositories and named `failed_repositories()` coexist; use `is_ok()` to require all repositories to succeed |
 | Required history/metadata/reflog hashes | Optional, validated `ContentHash` values |
 | Text signature | `Option<SignatureBytes>`; serialized as bytes, preserving binary data |
 | Zero-based GeoAPI fixtures / directly mutable query vectors | One-based `GeoapiHostId` values in a validated `GeoapiOrdering` |
 | `Option<MaybeRfc2822DateTime>` in scraped models | `Option<ReportedTimestamp>` |
 
 Error enums now retain endpoint context and underlying causes, so consumers matching error variants must update those matches. Serialized repository results nest the requested name, parsed manifest, and identity outcome inside `RepositoryManifest`; consumers of the old repository JSON layout must update their readers.
+
+### Configuration and identity
+
+Existing server JSON such as `{"server_type":"Stratum1","hostname":"example.org"}` still deserializes, using `http://example.org/` and the default `AutoDetect` backend. Explicit `backend_type` values remain supported. New configurations may instead specify `"endpoint":"https://example.org:8443"`. Supply exactly one address; configurations with both are rejected. Both forms undergo validation, so invalid legacy hostnames are not grandfathered in. Serialization writes the canonical `endpoint` form; reading old configurations is supported, but writing them back changes their shape.
+
+Applications with a public configuration format should own that format and convert it into scraper types at their network boundary. Keep the application's server identity separate from its transport endpoint. `Server::hostname()` excludes scheme and port, so HTTP and HTTPS endpoints or different ports on the same host share that value. A consumer keyed by hostname must reject those collisions or introduce an explicit stable identity before supporting multiple endpoints per host. Existing hostname history keys should not silently become full URLs. Endpoint hosts can also be IP addresses, which a consumer's hostname type may not support.
+
+### Revisions and timestamps
+
+`Revision` uses `u64` because revisions are non-negative, including zero, and CVMFS stores them as `uint64_t`; see the [CVMFS manifest definition](https://github.com/cvmfs/cvmfs/blob/devel/cvmfs/manifest.h). The previous `i32` representation restricted valid revisions to 2,147,483,647. Consumers should migrate revision observations, replication tracking, and persisted history together to an unsigned revision type. Until then, use `i32::try_from(revision.get())` and report out-of-range observations explicitly. Do not use truncating casts.
+
+The manifest's publication timestamp `T` is optional in the [CVMFS parser](https://github.com/cvmfs/cvmfs/blob/devel/cvmfs/manifest.cc). Absence is `None`; an explicitly supplied zero remains zero. A present `UnixTimestamp` can also exceed the datetime library's range: call `datetime()` to validate it. For a consumer that still requires an `i32` revision and a valid timestamp, a checked adapter can use:
+
+```rust
+use cvmfs_server_scraper::Manifest;
+
+fn legacy_observation(manifest: &Manifest) -> Result<(i32, i64), Box<dyn std::error::Error>> {
+    let revision = i32::try_from(manifest.revision().get())?;
+    let timestamp = manifest.published_at().ok_or("publication timestamp is missing")?;
+    Ok((revision, timestamp.datetime()?.timestamp()))
+}
+```
+
+Treat conversion errors as unavailable facts for the affected repository and preserve other observations. A domain that can represent missing publication time may still compare revisions, while reporting time-dependent checks as unknown. Never substitute zero or scrape time for a missing publication timestamp. Scrape time and publication time describe different events.
+
+Consumers must also preserve partial results at their own boundary: collecting conversions into a single `Result<Vec<_>, _>` recreates the all-or-nothing behavior. Pass the intended deadline through `ScrapeLimits`; an outer timeout that cancels the whole scrape first cannot recover its completed results.
+
+### Other compatibility types
 
 `MaybeRfc2822DateTime` remains available with private storage and a `new(Option<String>)` constructor for compatibility; new models avoid nested optional strings. `HexString` remains available for general hex data, but manifests use algorithm-aware digest types. JSON deserialization routes through validating constructors, including owned values and escaped strings. Scrape plans, bound repository results, and query results intentionally do not implement Deserialize. Deserializing a GeoapiOrdering reruns its relationship validation.
 

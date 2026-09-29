@@ -72,6 +72,9 @@
 //!                 for repository in server.repositories() {
 //!                     println!("{}: revision {}", repository.name(), repository.revision());
 //!                 }
+//!                 for failure in server.failed_repositories() {
+//!                     eprintln!("{}: {}", failure.name(), failure.error());
+//!                 }
 //!                 if let OptionalFetch::Failed(error) = server.contact() {
 //!                     eprintln!("Contact metadata: {error}");
 //!                 }
@@ -96,11 +99,13 @@
 //! by repository name; server results retain configuration order. See
 //! [`Server::scrape`] for the single-server entry point using [`ScrapeOptions`].
 //!
-//! A required index, status, or manifest failure produces a [`FailedServer`] and
-//! cancels unfinished work for that server. Other servers continue. A
-//! [`PopulatedServer`] retains successful repository results even if optional
-//! contact metadata or GeoAPI probes fail; inspect [`OptionalFetch`] and
-//! [`GeoapiOutcome`] separately. Missing timestamps remain `None`; present but
+//! Configuration and discovery failures produce a [`FailedServer`]. Once
+//! repositories are selected, [`PopulatedServer`] retains successful results and
+//! named [`FailedRepository`] errors independently, including at the server deadline.
+//! [`ScrapedServer::is_ok`] requires every selected repository to succeed;
+//! [`ScrapedServer::is_populated`] only indicates that collection was reached.
+//! Inspect optional contact metadata and GeoAPI outcomes through [`OptionalFetch`]
+//! and [`GeoapiOutcome`] separately. Missing timestamps remain `None`; present but
 //! unrecognized date strings remain available through [`ReportedTimestamp`].
 //!
 //! # Resource limits and validation scope

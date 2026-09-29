@@ -99,7 +99,7 @@ impl GeoapiOrdering {
 /// A completed query to a server's GeoAPI, bound to the queried host list.
 ///
 /// GeoAPI URLs sit below a repository, but the response orders hosts rather than
-/// repository contents. The scraper uses the first selected repository's endpoint
+/// repository contents. The scraper uses the first successful repository's endpoint
 /// and retains the server origin here. Wire IDs are one-based; [`GeoapiOrdering`]
 /// validates that they form a complete permutation before exposing ordered hosts.
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]

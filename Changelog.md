@@ -15,18 +15,22 @@ we reach version 0.1.0, up until then, expect breaking changes.
 - Correct forced-only selection and validate effective S3 selections before network work. Autodetection falls back only on index HTTP 404 and reports that assumption explicitly.
 - Support optional manifest fields, supported digest algorithms, unsigned protocol ranges, owned JSON deserialization, identity binding, and exact binary signature preservation.
 - Preserve unsupported timestamp text without assigning an incorrect UTC instant. Preserve optional contact/GeoAPI failure details without discarding repository results.
+- Preserve completed repositories and probes at the server deadline, report unfinished repositories by name, and isolate manifest/status failures to their repository.
+- Accept legacy server JSON `hostname` values as HTTP origins; reject configurations supplying both `hostname` and `endpoint`.
 
 ### Breaking changes
 
 - Introduced validated `ServerEndpoint`, `RepositoryName`, manifest scalar/hash types, `RepositorySelection`, immutable `ValidatedScrapePlan`, `RepositoryManifest`, and `GeoapiOrdering`.
 - Populated objects now expose read-only accessors. Server construction takes an explicit HTTP(S) origin, and single-server scraping takes `ScrapeOptions`.
 - Backend resolution and optional probe outcomes use dedicated enums. See the README migration table for API and serialization changes.
+- Repository failures now appear in `PopulatedServer::failed_repositories()`, including when every repository failed. Use `ScrapedServer::is_ok()` for complete repository success; `is_populated()` only indicates that collection was reached. Configuration and discovery failures still produce `FailedServer`.
 - Replaced default production-network tests with deterministic loopback regressions; public smoke tests are opt-in.
 - Narrowed runtime dependency features, moved test dependencies to dev-dependencies, and added CI linting, caching, bounded jobs and advisory checks.
 
 ### Changed
 
 - Restored crate and API documentation for the validated types, including manifest fields, builder transitions, server roles, and optional metadata semantics.
+- Documented hostname identity versus transport endpoints, canonical configuration serialization, checked revision/timestamp conversions, and consumer handling of partial results.
 - Added an `online-tests` PR label to enable public EESSI checks covering discovery, metadata, repository selection, GeoAPI, S3 backends, mixed-server scraping, and repeated cycles using the same validated scraper.
 - Replaced `yare` with `rstest` named cases, expanded domain and loopback regression coverage, and added downloadable CI coverage reports.
 - Updated all Rust dependencies to their latest compatible releases.

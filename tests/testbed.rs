@@ -149,6 +149,7 @@ fn options(selection: RepositorySelection) -> ScrapeOptions {
 }
 
 fn populated(result: ScrapedServer) -> PopulatedServer {
+    assert!(result.is_ok(), "repository collection failed: {result:#?}");
     match result {
         ScrapedServer::Populated(server) => *server,
         ScrapedServer::Failed(server) => panic!(
@@ -454,36 +455,48 @@ async fn testbed_failure_isolation_and_recovery(
     let results = scrape_all(&scraper).await;
     for (i, result) in results.into_iter().enumerate() {
         if i == affected {
-            let failed = result
-                .as_failed_server()
-                .expect("outage must fail this server");
-            if freeze {
-                assert!(
-                    match failed.error() {
-                        CVMFSScraperError::Scrape(ScrapeError::Timeout(_)) => true,
-                        CVMFSScraperError::Scrape(ScrapeError::Fetch { source, .. }) =>
-                            source.is_timeout(),
-                        _ => false,
-                    },
-                    "expected timeout, got {:?}",
-                    failed.error()
-                );
-            } else {
-                assert!(
-                    matches!(
-                        failed.error(),
-                        CVMFSScraperError::Scrape(
-                            ScrapeError::Fetch { .. }
-                                | ScrapeError::HttpStatus {
-                                    status: 500..=599,
-                                    ..
-                                }
-                                | ScrapeError::Timeout(_)
-                        )
-                    ),
-                    "expected transport/upstream failure, got {:?}",
-                    failed.error()
-                );
+            assert!(!result.is_ok(), "outage must fail collection");
+            let errors = match &result {
+                ScrapedServer::Failed(server) => vec![server.error()],
+                ScrapedServer::Populated(server) => {
+                    assert!(server.repositories().is_empty());
+                    assert_eq!(server.failed_repositories().len(), 2);
+                    server
+                        .failed_repositories()
+                        .iter()
+                        .map(FailedRepository::error)
+                        .collect()
+                }
+            };
+            for error in errors {
+                if freeze {
+                    assert!(
+                        match error {
+                            CVMFSScraperError::Scrape(ScrapeError::Timeout(_)) => true,
+                            CVMFSScraperError::Scrape(ScrapeError::Fetch { source, .. }) =>
+                                source.is_timeout(),
+                            _ => false,
+                        },
+                        "expected timeout, got {:?}",
+                        error
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            error,
+                            CVMFSScraperError::Scrape(
+                                ScrapeError::Fetch { .. }
+                                    | ScrapeError::HttpStatus {
+                                        status: 500..=599,
+                                        ..
+                                    }
+                                    | ScrapeError::Timeout(_)
+                            )
+                        ),
+                        "expected transport/upstream failure, got {:?}",
+                        error
+                    );
+                }
             }
         } else {
             let server = populated(result);
