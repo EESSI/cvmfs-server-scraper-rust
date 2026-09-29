@@ -3,10 +3,13 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this will adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) once
-we reach version 0.1.0, up until then, expect breaking changes.
+and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+starting with version 0.1.0. While the crate is pre-1.0, breaking API changes
+increment the minor version; compatible changes increment the patch version.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-09-29
 
 ### Fixed
 
@@ -37,6 +40,7 @@ we reach version 0.1.0, up until then, expect breaking changes.
 - Updated all Rust dependencies to their latest compatible releases.
 - Raised the minimum supported Rust version to 1.88 for the updated dependencies.
 - Updated GitHub Actions checkout to v7.0.1 and added tests of the locked dependencies on Rust 1.88 and stable.
+- Updated the crate's repository and homepage links to the EESSI organization.
 
 ## [0.0.7] - 2026-06-08
 
@@ -90,7 +94,7 @@ we reach version 0.1.0, up until then, expect breaking changes.
 
 - Improved documentation for relevant types.
 - Re-exported MaybeRfc2822DateTime and Manifest.
-  
+
 ### Changed
 
 - Moved from using a from_str-like interface to create Manifests to implementing FromStr and thus allowing the use of parse().

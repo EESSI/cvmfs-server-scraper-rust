@@ -2,6 +2,21 @@
 
 This Rust library fetches CVMFS repository indexes, manifests, status files, server metadata, and GeoAPI responses. Domain values validate at input boundaries, HTTP work has explicit resource limits, and results distinguish backend assumptions and optional probe failures.
 
+## Version 0.1.0 — 2026-09-29
+
+Version 0.1.0 introduces validated configuration and domain types, bounded HTTP requests, and reports that preserve successful repositories alongside individual failures. It requires **Rust 1.88 or newer** and includes breaking API and serialization changes from 0.0.7. See the [release notes](Changelog.md#010---2026-09-29) and [migration guide](#migrating-from-007) before upgrading.
+
+Starting with 0.1.0, compatible changes use patch releases; breaking API changes use a new minor version while the crate remains pre-1.0.
+
+## Installation
+
+Add the library to your `Cargo.toml`:
+
+```toml
+[dependencies]
+cvmfs_server_scraper = "0.1.0"
+```
+
 ## Usage
 
 ```rust
@@ -130,7 +145,7 @@ Use `Manifest::from_bytes` for network/file contents. `signature().as_bytes()` (
 
 ## Migrating from 0.0.7
 
-These are breaking API changes, grouped together while the crate is pre-1.0:
+Version 0.1.0 introduces the following breaking API changes from 0.0.7:
 
 | Previously | Now |
 | --- | --- |

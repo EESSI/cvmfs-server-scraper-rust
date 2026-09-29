@@ -1,13 +1,13 @@
 [package]
 name = "cvmfs_server_scraper"
-version = "0.0.7"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Terje Kvernes <terje@kvernes.no>"]
 license = "MIT"
 description = "A scraper for CVMFS servers"
-repository = "https://github.com/terjekv/cvmfs-server-scraper-rust"
-homepage = "https://github.com/terjekv/cvmfs-server-scraper-rust"
+repository = "https://github.com/EESSI/cvmfs-server-scraper-rust"
+homepage = "https://github.com/EESSI/cvmfs-server-scraper-rust"
 readme = "README.md"
 keywords = ["cvmfs", "scraper", "monitoring", "eessi"]
 
