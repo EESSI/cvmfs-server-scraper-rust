@@ -1,975 +1,714 @@
-use log::{debug, error, trace, warn};
+use crate::models::{cvmfs_status_json::StatusJSON, repositories_json::RepositoriesJSON};
+use crate::transport::ScrapeClient;
+use crate::utilities::generate_random_string;
+use crate::{
+    CVMFSScraperError, ConfigurationError, ContactMetadata, GenericError, GeoapiOrdering,
+    GeoapiOutcome, GeoapiProbe, GeoapiServerQuery, GeoapiSkipReason, Hostname, Manifest,
+    ReportedTimestamp, RepositoryManifest, RepositoryName, Revision, ScrapeError, ScrapeOptions,
+    Scraper, ScraperCommon, ServerEndpoint,
+};
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use tokio::time::{timeout_at, Instant};
 
-use crate::constants::DEFAULT_GEOAPI_SERVERS;
-use crate::errors::{CVMFSScraperError, GenericError, ManifestError, ScrapeError};
-use crate::models::cvmfs_status_json::StatusJSON;
-use crate::models::geoapi::GeoapiServerQuery;
-use crate::models::meta_json::MetaJSON;
-use crate::models::repositories_json::RepositoriesJSON;
-use crate::models::{Hostname, Manifest, MaybeRfc2822DateTime};
-use crate::utilities::{fetch_json, fetch_text, generate_random_string};
-
-/// The type of server we're dealing with.
-///
-/// Stratum0: The main server that holds the master copy of the data.
-/// Stratum1: A server that holds a copy of the data from the Stratum0 server.
-/// SyncServer: A server that holds a copy of the data from the Stratum0 server, but is not a Stratum1 server.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Copy)]
+/// Server role used to check whether a CVMFS index contains primaries or replicas.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy)]
 pub enum ServerType {
+    /// Origin server holding the primary repository data; its index must not list replicas.
     Stratum0,
+    /// Replica server holding copies of Stratum0 repositories.
     Stratum1,
+    /// Synchronization server holding replicated data without being a Stratum1 server.
     SyncServer,
 }
 
-/// The type of backend a given server is using.
-///
-/// S3: The server is using S3 as the backend.
-/// CVMFS: The server is using a standard CVMFS web server as the backend.
-/// AutoDetect: The server will try to detect the backend type.
-///
-/// The AutoDetect backend type will try to fetch the repositories.json file from the server. If it
-/// fails, it will assume the server is using S3 as the backend. If it succeeds, it will assume the
-/// server is using CVMFS as the backend.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Copy)]
+/// Requested backend policy. AutoDetect falls back only on index HTTP 404.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy, Default)]
 pub enum ServerBackendType {
+    /// Skip index discovery and fetch explicitly selected repositories from an S3 backend.
     S3,
+    /// Require a valid `repositories.json` index consistent with the configured role.
     CVMFS,
+    /// Use a valid index when available; only an index HTTP 404 permits an S3 assumption.
+    /// Other HTTP, transport, and parsing failures remain errors.
+    #[default]
     AutoDetect,
 }
 
-/// A server object.
+/// Evidence for the backend choice. HTTP 404 is an assumption, not proof of S3.
+#[derive(Debug, Serialize, Clone, PartialEq, Eq, Copy)]
+pub enum BackendResolution {
+    /// The caller selected S3 explicitly.
+    ConfiguredS3,
+    /// The caller selected CVMFS and its index passed validation.
+    ConfiguredCvmfs,
+    /// Autodetection obtained and validated a CVMFS index.
+    DiscoveredCvmfs,
+    /// Autodetection received an index HTTP 404 and used configured repository names.
+    AssumedS3IndexNotFound,
+}
+impl BackendResolution {
+    pub fn is_s3(self) -> bool {
+        matches!(self, Self::ConfiguredS3 | Self::AssumedS3IndexNotFound)
+    }
+}
+
+/// Configuration of a CVMFS server: its role, requested backend, and HTTP(S) origin.
 ///
-/// This object represents a CVMFS server. It contains the server type, the backend type, and the
-/// hostname of the server.
-///
-/// The server object can be used to scrape the server for information about the repositories it
-/// hosts. The scrape method will return a populated server object that contains information about
-/// the server and the repositories it hosts.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+/// Construction does not fetch metadata. [`Self::scrape`] returns a
+/// [`ScrapedServer`] containing either read-only results or the original
+/// configuration together with an error. Use [`Scraper`] to share a connection
+/// pool and request budget across multiple servers or repeated runs.
+/// JSON accepts either `endpoint` or legacy `hostname` (converted to HTTP), but
+/// not both. Serialization always emits the canonical `endpoint` form.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(try_from = "ServerConfig")]
 pub struct Server {
-    pub server_type: ServerType,
-    #[serde(default = "default_backend_type")]
-    pub backend_type: ServerBackendType,
-    pub hostname: Hostname,
+    server_type: ServerType,
+    backend_type: ServerBackendType,
+    endpoint: ServerEndpoint,
 }
 
-fn default_backend_type() -> ServerBackendType {
-    ServerBackendType::AutoDetect
+#[derive(Deserialize)]
+struct ServerConfig {
+    server_type: ServerType,
+    #[serde(default)]
+    backend_type: ServerBackendType,
+    endpoint: Option<ServerEndpoint>,
+    hostname: Option<Hostname>,
+}
+impl TryFrom<ServerConfig> for Server {
+    type Error = ConfigurationError;
+
+    fn try_from(config: ServerConfig) -> Result<Self, Self::Error> {
+        let endpoint = match (config.endpoint, config.hostname) {
+            (Some(endpoint), None) => endpoint,
+            (None, Some(hostname)) => format!("http://{hostname}").parse()?,
+            _ => {
+                return Err(ConfigurationError {
+                    field: "server address",
+                    reason: "specify exactly one of endpoint or legacy hostname".into(),
+                })
+            }
+        };
+        Ok(Self::new(config.server_type, config.backend_type, endpoint))
+    }
 }
 
-/// A populated server object.
-///
-/// This type is not to be manually created, but is the result of scraping a server object.
-///
-/// This object represents a CVMFS server that has been scraped for information about the repositories
-/// it hosts. Note that replicas and repositories are consolidated into the attribute "repositories" as
-/// they are functionally the same and no server will have both.
-///
-/// Fields:
-///
-/// - server_type: The server type (Stratum0, Stratum1, or SyncServer)
-/// - backend_type: The backend type (S3, CVMFS, or AutoDetect)
-/// - backend_detected: The detected backend type (S3 or CVMFS), will never be AutoDetect.
-/// - hostname: The hostname of the server
-/// - repositories: A list of populated repositories (or replicas)
-/// - metadata: Metadata about the server (merged from repositories.json and meta.json, if found).
-///
-/// Metadata is not available servers using S3 as the backend as they do not provide repositories.json
-#[derive(Debug, Clone, PartialEq)]
-pub struct PopulatedServer {
-    pub server_type: ServerType,
-    pub backend_type: ServerBackendType,
-    pub backend_detected: ServerBackendType,
-    pub hostname: Hostname,
-    pub repositories: Vec<PopulatedRepositoryOrReplica>,
-    pub metadata: ServerMetadata,
-    pub geoapi: GeoapiServerQuery,
+// Every stage shares the server's absolute deadline. Check before polling so
+// queued repositories and probes cannot start requests after it has expired.
+async fn before_deadline<T, E: From<ScrapeError>>(
+    deadline: Instant,
+    context: &str,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    if Instant::now() >= deadline {
+        return Err(ScrapeError::Timeout(context.into()).into());
+    }
+    timeout_at(deadline, future)
+        .await
+        .unwrap_or_else(|_| Err(ScrapeError::Timeout(context.into()).into()))
 }
 
-/// A server that failed to scrape.
+impl Server {
+    /// Combine a server role and backend policy with a validated endpoint.
+    pub fn new(
+        server_type: ServerType,
+        backend_type: ServerBackendType,
+        endpoint: ServerEndpoint,
+    ) -> Self {
+        Self {
+            server_type,
+            backend_type,
+            endpoint,
+        }
+    }
+    /// Configured server role, checked against discovery data when available.
+    pub fn server_type(&self) -> ServerType {
+        self.server_type
+    }
+    /// Requested backend policy; see [`ServerReport::backend`] for the outcome.
+    pub fn backend_type(&self) -> ServerBackendType {
+        self.backend_type
+    }
+    /// Configured HTTP(S) origin, including any explicit port.
+    pub fn endpoint(&self) -> &ServerEndpoint {
+        &self.endpoint
+    }
+    /// Host component of the origin, without its scheme or port; may be an IP address.
+    pub fn hostname(&self) -> &str {
+        self.endpoint.host()
+    }
+    fn failed(&self, error: CVMFSScraperError) -> ScrapedServer {
+        ScrapedServer::Failed(FailedServer {
+            server: self.clone(),
+            error,
+        })
+    }
+
+    /// Convenience entry point using exactly the builder's validation and transport.
+    ///
+    /// Fetches the selected repositories' status files and manifests, plus optional
+    /// contact metadata and GeoAPI results. Options control selection, probe hosts,
+    /// deadlines, response sizes, and concurrency. Configuration and discovery
+    /// errors produce [`ScrapedServer::Failed`]; repository and optional-probe
+    /// failures are retained in [`ServerReport`]. Each call creates a new client; use a
+    /// validated [`Scraper`] when the connection pool should be reused across calls.
+    ///
+    /// ```no_run
+    /// use cvmfs_server_scraper::{RepositorySelection, ScrapeOptions, Server, ServerBackendType, ServerType};
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let server = Server::new(ServerType::SyncServer, ServerBackendType::S3,
+    ///     "http://aws-eu-west-s1-sync.eessi.science".parse()?);
+    /// let options = ScrapeOptions::default().with_selection(
+    ///     RepositorySelection::only(["software.eessi.io".parse()?]));
+    /// let result = server.scrape(options).await;
+    /// # let _ = result;
+    /// # Ok(()) }
+    /// ```
+    pub async fn scrape(&self, options: ScrapeOptions) -> ScrapedServer {
+        match Scraper::new()
+            .options(options)
+            .with_servers(vec![self.clone()])
+            .validate()
+        {
+            Ok(scraper) => scraper
+                .scrape()
+                .await
+                .pop()
+                .expect("one configured server yields one result"),
+            Err(error) => self.failed(error.into()),
+        }
+    }
+    pub(crate) async fn scrape_with(
+        &self,
+        client: &ScrapeClient,
+        options: &ScrapeOptions,
+    ) -> ScrapedServer {
+        log::debug!("Scraping {}", self.endpoint);
+        let deadline = Instant::now() + options.limits().server_timeout().get();
+        match self.try_scrape(client, options, deadline).await {
+            Ok(server) => ScrapedServer::Collected(Box::new(server)),
+            Err(error) => self.failed(error),
+        }
+    }
+    async fn try_scrape(
+        &self,
+        client: &ScrapeClient,
+        options: &ScrapeOptions,
+        deadline: Instant,
+    ) -> Result<ServerReport, CVMFSScraperError> {
+        let (backend, index) = match self.backend_type {
+            ServerBackendType::S3 => (BackendResolution::ConfiguredS3, None),
+            ServerBackendType::CVMFS | ServerBackendType::AutoDetect => {
+                match before_deadline(
+                    deadline,
+                    &self.endpoint.to_string(),
+                    client.json::<RepositoriesJSON>(&self.endpoint.index()),
+                )
+                .await
+                {
+                    Ok(index) => {
+                        self.validate_index(&index, options)?;
+                        let resolution = if self.backend_type == ServerBackendType::CVMFS {
+                            BackendResolution::ConfiguredCvmfs
+                        } else {
+                            BackendResolution::DiscoveredCvmfs
+                        };
+                        (resolution, Some(index))
+                    }
+                    Err(error)
+                        if self.backend_type == ServerBackendType::AutoDetect
+                            && error.is_not_found() =>
+                    {
+                        (BackendResolution::AssumedS3IndexNotFound, None)
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
+        let (metadata, discovered) = match index {
+            Some(index) => {
+                let metadata = ServerMetadata {
+                    schema_version: Some(index.schema),
+                    cvmfs_version: index.cvmfs_version,
+                    last_geodb_update: index.last_geodb_update,
+                    os_id: index.os_id,
+                    os_version_id: index.os_version_id,
+                    os_pretty_name: index.os_pretty_name,
+                };
+                let discovered = index
+                    .repositories
+                    .into_iter()
+                    .chain(index.replicas)
+                    .map(|r| r.name)
+                    .collect::<Vec<_>>();
+                (metadata, discovered)
+            }
+            None => (ServerMetadata::default(), Vec::new()),
+        };
+        let names = options.selection().resolve(discovered);
+        let limit = options.limits().repository_count().get();
+        if names.len() > limit {
+            return Err(ScrapeError::RepositoryLimit {
+                actual: names.len(),
+                limit,
+            }
+            .into());
+        }
+        if backend.is_s3() && names.is_empty() {
+            return Err(ScrapeError::EmptyRepositoryList(self.endpoint.to_string()).into());
+        }
+        let mut jobs = stream::iter(names)
+            .map(|name| async move {
+                let result = before_deadline(
+                    deadline,
+                    &self.endpoint.to_string(),
+                    self.scrape_repository(client, &name),
+                )
+                .await;
+                result.map_err(|error| FailedRepository { name, error })
+            })
+            .buffer_unordered(options.limits().repositories().get());
+        let mut repositories = Vec::new();
+        let mut failed_repositories = Vec::new();
+        while let Some(result) = jobs.next().await {
+            match result {
+                Ok(repository) => repositories.push(repository),
+                Err(failure) => failed_repositories.push(failure),
+            }
+        }
+        repositories.sort_unstable_by(|a, b| a.name().cmp(b.name()));
+        failed_repositories.sort_unstable_by(|a, b| a.name().cmp(b.name()));
+        let contact_future = async {
+            let endpoint = self.endpoint.metadata();
+            match before_deadline(
+                deadline,
+                endpoint.url().as_str(),
+                client.json::<ContactMetadata>(&endpoint),
+            )
+            .await
+            {
+                Ok(value) => OptionalFetch::Available(value),
+                Err(error) if error.is_not_found() => OptionalFetch::Absent,
+                Err(error) => OptionalFetch::Failed(error),
+            }
+        };
+        let (contact, geoapi) = futures::join!(
+            contact_future,
+            self.fetch_geoapi(client, options, backend, repositories.first(), deadline)
+        );
+        Ok(ServerReport {
+            server: self.clone(),
+            backend,
+            repositories,
+            failed_repositories,
+            metadata,
+            contact,
+            geoapi,
+        })
+    }
+    fn validate_index(
+        &self,
+        index: &RepositoriesJSON,
+        options: &ScrapeOptions,
+    ) -> Result<(), ScrapeError> {
+        if index.schema != 1 {
+            return Err(ScrapeError::UnsupportedSchema(index.schema));
+        }
+        let count = index
+            .repositories
+            .len()
+            .saturating_add(index.replicas.len());
+        let limit = options.limits().repository_count().get();
+        if count > limit {
+            return Err(ScrapeError::RepositoryLimit {
+                actual: count,
+                limit,
+            });
+        }
+        let mismatch = match self.server_type {
+            ServerType::Stratum0 if !index.replicas.is_empty() => {
+                Some("Stratum0 index contains replicas")
+            }
+            ServerType::Stratum1 | ServerType::SyncServer if index.replicas.is_empty() => {
+                Some("replica server index contains no replicas")
+            }
+            ServerType::Stratum1 | ServerType::SyncServer if !index.repositories.is_empty() => {
+                Some("replica server index also contains primary repositories")
+            }
+            _ => None,
+        };
+        if let Some(reason) = mismatch {
+            return Err(ScrapeError::ServerTypeMismatch(format!(
+                "{}: {reason}",
+                self.endpoint
+            )));
+        }
+        Ok(())
+    }
+    async fn scrape_repository(
+        &self,
+        client: &ScrapeClient,
+        name: &RepositoryName,
+    ) -> Result<PopulatedRepositoryOrReplica, CVMFSScraperError> {
+        let repository = self.endpoint.repository(name);
+        let status_endpoint = repository.status();
+        let manifest_endpoint = repository.manifest();
+        let (status, bytes) = futures::try_join!(
+            client.json::<StatusJSON>(&status_endpoint),
+            client.bytes(&manifest_endpoint)
+        )?;
+        let manifest = Manifest::from_bytes(&bytes)
+            .and_then(|m| m.bind_to_repository(name.clone()))
+            .map_err(|source| CVMFSScraperError::Manifest {
+                url: manifest_endpoint.url().to_string(),
+                source,
+            })?;
+        Ok(PopulatedRepositoryOrReplica {
+            manifest,
+            last_snapshot: status.last_snapshot,
+            last_gc: status.last_gc,
+        })
+    }
+    async fn fetch_geoapi(
+        &self,
+        client: &ScrapeClient,
+        options: &ScrapeOptions,
+        backend: BackendResolution,
+        repository: Option<&PopulatedRepositoryOrReplica>,
+        deadline: Instant,
+    ) -> GeoapiOutcome {
+        let hosts = match options.geoapi() {
+            GeoapiProbe::Disabled => return GeoapiOutcome::Skipped(GeoapiSkipReason::Disabled),
+            GeoapiProbe::Enabled(hosts) => hosts,
+        };
+        if backend.is_s3() {
+            return GeoapiOutcome::Unsupported;
+        }
+        if self.server_type == ServerType::Stratum0 {
+            return GeoapiOutcome::Skipped(GeoapiSkipReason::Stratum0);
+        }
+        let Some(repository) = repository else {
+            return GeoapiOutcome::Skipped(GeoapiSkipReason::NoRepositories);
+        };
+        let endpoint = self
+            .endpoint
+            .repository(repository.name())
+            .geoapi(&generate_random_string(12), hosts.as_slice());
+        let result = before_deadline(deadline, endpoint.url().as_str(), async {
+            let bytes = client.bytes(&endpoint).await?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|e| ScrapeError::GeoAPIFailure(format!("{}: {e}", endpoint.url())))?;
+            let ordering = GeoapiOrdering::from_response(hosts.as_slice().to_vec(), text)
+                .map_err(|e| ScrapeError::GeoAPIFailure(format!("{}: {e}", endpoint.url())))?;
+            Ok(GeoapiServerQuery::new(self.endpoint.clone(), ordering))
+        })
+        .await;
+        match result {
+            Ok(query) => GeoapiOutcome::Available(query),
+            Err(error) => GeoapiOutcome::Failed(error),
+        }
+    }
+}
+
+/// Outcome of an optional resource fetch, preserving absence separately from failure.
+#[derive(Debug, Clone)]
+pub enum OptionalFetch<T> {
+    /// The resource was fetched and parsed successfully.
+    Available(T),
+    /// The endpoint returned HTTP 404.
+    Absent,
+    /// Fetching or parsing failed for another reason.
+    Failed(ScrapeError),
+}
+
+/// Repository collection outcome, independent of contact metadata and GeoAPI.
 ///
-/// This struct is used to store information about a server that failed to scrape. It contains the
-/// hostname of the server and the error that occurred.
+/// Obtained from [`ServerReport::repository_outcome`]. Configuration and
+/// discovery failures instead produce [`ScrapedServer::Failed`] without a report.
+/// This enum does not describe the overall health of a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryOutcome {
+    /// At least one repository was selected, and every selected repository succeeded.
+    Complete,
+    /// Some selected repositories succeeded and some failed.
+    Partial,
+    /// At least one repository was selected, and every selected repository failed.
+    AllFailed,
+    /// The effective selection contained no repositories; none were fetched.
+    Empty,
+}
+
+/// Read-only results after successful discovery/selection, including repository
+/// failures. Inspect [`Self::repository_outcome`] and ancillary contact/GeoAPI
+/// outcomes before treating the whole server as healthy. A report can contain
+/// zero successful repositories; [`RepositoryOutcome::Empty`] distinguishes an
+/// empty selection from [`RepositoryOutcome::AllFailed`].
+///
+/// Created only by a completed scrape. Primary repositories and replicas share
+/// [`Self::repositories`], sorted by name. The configured role determines which
+/// index entries are accepted. [`Self::metadata`] comes from the repository index;
+/// [`Self::contact`] independently describes the optional `meta.json` fetch.
+/// Index metadata is absent on S3, but contact metadata is still requested.
+#[derive(Debug, Clone)]
+pub struct ServerReport {
+    server: Server,
+    backend: BackendResolution,
+    repositories: Vec<PopulatedRepositoryOrReplica>,
+    failed_repositories: Vec<FailedRepository>,
+    metadata: ServerMetadata,
+    contact: OptionalFetch<ContactMetadata>,
+    geoapi: GeoapiOutcome,
+}
+impl ServerReport {
+    /// Summarize the selected repositories, including failures and timeouts.
+    /// Computed from the immutable results so it cannot disagree with them.
+    /// Optional-probe outcomes do not affect this value.
+    ///
+    /// ```
+    /// use cvmfs_server_scraper::{RepositoryOutcome, ServerReport};
+    ///
+    /// fn describe(report: &ServerReport) -> &'static str {
+    ///     match report.repository_outcome() {
+    ///         RepositoryOutcome::Complete => "Every selected repository succeeded",
+    ///         RepositoryOutcome::Partial => "Some repositories failed; successes remain available",
+    ///         RepositoryOutcome::AllFailed => "Every selected repository failed",
+    ///         RepositoryOutcome::Empty => "No repositories were selected",
+    ///     }
+    /// }
+    /// ```
+    pub fn repository_outcome(&self) -> RepositoryOutcome {
+        match (
+            self.repositories.is_empty(),
+            self.failed_repositories.is_empty(),
+        ) {
+            (false, true) => RepositoryOutcome::Complete,
+            (false, false) => RepositoryOutcome::Partial,
+            (true, false) => RepositoryOutcome::AllFailed,
+            (true, true) => RepositoryOutcome::Empty,
+        }
+    }
+    /// Original server configuration, including the requested backend policy.
+    pub fn server(&self) -> &Server {
+        &self.server
+    }
+    /// Host component of the original server endpoint.
+    pub fn hostname(&self) -> &str {
+        self.server.hostname()
+    }
+    /// Resolved backend and the evidence or configuration behind that choice.
+    pub fn backend(&self) -> BackendResolution {
+        self.backend
+    }
+    /// Successful repository/replica results in lexical name order.
+    pub fn repositories(&self) -> &[PopulatedRepositoryOrReplica] {
+        &self.repositories
+    }
+    /// Failed repository/replica results in lexical name order. Together with
+    /// [`Self::repositories`], accounts for every selected name exactly once.
+    /// Includes queued and active repositories that reached the server deadline.
+    pub fn failed_repositories(&self) -> &[FailedRepository] {
+        &self.failed_repositories
+    }
+    /// Metadata obtained from the repository index, if this backend supplied one.
+    pub fn metadata(&self) -> &ServerMetadata {
+        &self.metadata
+    }
+    /// Independent outcome of fetching optional server contact metadata.
+    pub fn contact(&self) -> &OptionalFetch<ContactMetadata> {
+        &self.contact
+    }
+    /// Available ordering, skip/unsupported reason, or optional probe error.
+    pub fn geoapi(&self) -> &GeoapiOutcome {
+        &self.geoapi
+    }
+    /// Whether the completed results contain the given repository or replica.
+    pub fn has_repository(&self, name: &RepositoryName) -> bool {
+        self.repositories.iter().any(|r| r.name() == name)
+    }
+    pub fn output(&self) {
+        println!("{self:#?}");
+    }
+}
+impl std::fmt::Display for ServerReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({:?}, {:?})",
+            self.server.endpoint, self.server.server_type, self.backend
+        )
+    }
+}
+
+/// A failed configuration or discovery/selection step with the original server
+/// configuration and its error. Once repositories are selected, their failures
+/// and timeouts stay on [`ServerReport`], alongside any successful results.
 #[derive(Debug, Clone)]
 pub struct FailedServer {
-    pub hostname: Hostname,
-    pub server_type: ServerType,
-    pub backend_type: ServerBackendType,
-    pub error: CVMFSScraperError,
+    server: Server,
+    error: CVMFSScraperError,
 }
-
+impl FailedServer {
+    pub fn server(&self) -> &Server {
+        &self.server
+    }
+    pub fn hostname(&self) -> &str {
+        self.server.hostname()
+    }
+    pub fn error(&self) -> &CVMFSScraperError {
+        &self.error
+    }
+}
+/// Result of scraping one configured server.
+///
+/// `Collected` means a report is available, including when every selected
+/// repository failed. Match this enum, then inspect
+/// [`ServerReport::repository_outcome`] and the optional-probe outcomes separately.
 #[derive(Debug, Clone)]
 pub enum ScrapedServer {
-    Populated(Box<PopulatedServer>),
+    /// Discovery/selection succeeded. Repository and ancillary failures are
+    /// retained alongside successes, even when every selected repository failed.
+    Collected(Box<ServerReport>),
+    /// Configuration or discovery/selection failed before repository collection.
     Failed(FailedServer),
 }
-
 impl ScrapedServer {
-    pub fn is_failed(&self) -> bool {
-        matches!(self, ScrapedServer::Failed(_))
-    }
-
-    pub fn is_populated(&self) -> bool {
-        matches!(self, ScrapedServer::Populated(_))
-    }
-
-    pub fn is_ok(&self) -> bool {
-        self.is_populated()
-    }
-
-    pub fn as_populated_server(&self) -> Option<&PopulatedServer> {
+    /// Borrow the collection report, regardless of its repository/probe outcomes.
+    pub fn as_report(&self) -> Option<&ServerReport> {
         match self {
-            ScrapedServer::Populated(server) => Some(server.as_ref()),
-            ScrapedServer::Failed(_) => None,
+            Self::Collected(value) => Some(value),
+            _ => None,
         }
     }
-
+    /// Borrow a failure that prevented repository collection.
     pub fn as_failed_server(&self) -> Option<&FailedServer> {
         match self {
-            ScrapedServer::Failed(server) => Some(server),
-            ScrapedServer::Populated(_) => None,
+            Self::Failed(value) => Some(value),
+            _ => None,
         }
     }
-
-    pub fn into_populated_server(self) -> Result<PopulatedServer, GenericError> {
+    /// Extract the collection report. `Ok` means a report exists, not that its
+    /// repositories or optional probes all succeeded; inspect their outcomes.
+    pub fn into_report(self) -> Result<ServerReport, GenericError> {
         match self {
-            ScrapedServer::Populated(server) => Ok(*server),
-            ScrapedServer::Failed(failed) => Err(GenericError::TypeError(format!(
-                "{} is a failed server",
-                failed.hostname
+            Self::Collected(value) => Ok(*value),
+            Self::Failed(value) => Err(GenericError::TypeError(format!(
+                "{}: {}",
+                value.hostname(),
+                value.error()
             ))),
         }
     }
-
     pub fn into_failed_server(self) -> Result<FailedServer, GenericError> {
         match self {
-            ScrapedServer::Failed(failed) => Ok(failed),
-            ScrapedServer::Populated(server) => Err(GenericError::TypeError(format!(
-                "{} is a populated server",
-                server.hostname
+            Self::Failed(value) => Ok(value),
+            Self::Collected(value) => Err(GenericError::TypeError(format!(
+                "{} has a collection report",
+                value.hostname()
             ))),
         }
     }
-
-    pub fn get_populated_server(self) -> Result<PopulatedServer, GenericError> {
-        self.into_populated_server()
-    }
-
     pub fn get_failed_server(self) -> Result<FailedServer, GenericError> {
         self.into_failed_server()
     }
 }
 
-impl Server {
-    pub fn new(
-        server_type: ServerType,
-        backend_type: ServerBackendType,
-        hostname: Hostname,
-    ) -> Self {
-        trace!("Creating server object for {}", hostname);
-        Server {
-            server_type,
-            backend_type,
-            hostname,
-        }
+/// Failure of one selected repository. Other repositories continue independently.
+#[derive(Debug, Clone)]
+pub struct FailedRepository {
+    name: RepositoryName,
+    error: CVMFSScraperError,
+}
+impl FailedRepository {
+    pub fn name(&self) -> &RepositoryName {
+        &self.name
     }
-
-    pub fn to_failed_server(&self, error: CVMFSScraperError) -> FailedServer {
-        FailedServer {
-            hostname: self.hostname.clone(),
-            server_type: self.server_type,
-            backend_type: self.backend_type,
-            error,
-        }
-    }
-
-    /// Scrape the server for information about itself and its repos.
-    ///
-    /// This method will scrape the server for information about the repositories it hosts. It will
-    /// also fetch metadata about the server from the repositories.json and meta.json files, if they
-    /// are available.
-    ///
-    /// ## Arguments
-    ///
-    /// - `repositories`: A list of repositories to scrape. This may be empty unless the backend is S3.
-    /// - `ignored_repositories`: A list of repositories to ignore. This may be empty.
-    /// - `only_scrape_forced_repos`: If true, only the repositories provided in the `repositories` argument will be scraped
-    ///   which overrides ignored_repositories. If false, the repositories from repositories.json will be merged with
-    ///   the provided list and then filtered by ignored_repositories.
-    ///
-    /// ## Returns
-    ///
-    /// A ScrapedServer enum containing either a PopulatedServer or a FailedServer.
-    pub async fn scrape<R>(
-        &self,
-        repositories: Vec<R>,
-        ignored_repositories: Vec<R>,
-        only_scrape_forced_repos: bool,
-        geoapi_servers: Option<Vec<Hostname>>,
-    ) -> ScrapedServer
-    where
-        R: AsRef<str> + std::fmt::Display + Clone,
-    {
-        debug!("Scraping server {}", self.hostname);
-
-        let geoapi_servers = match geoapi_servers {
-            Some(servers) => servers,
-            None => DEFAULT_GEOAPI_SERVERS.clone(),
-        };
-
-        let ignore = ignored_repositories
-            .iter()
-            .map(|r| r.to_string())
-            .collect::<std::collections::BTreeSet<_>>();
-
-        let client = reqwest::Client::new();
-        let mut all_repos = repositories
-            .iter()
-            .map(|repo| repo.to_string())
-            .filter(|repo| !ignore.contains(repo))
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut populated_repos = vec![];
-        let mut backend_detected = self.backend_type;
-
-        let mut metadata = MetadataFromRepoJSON {
-            schema_version: None,
-            cvmfs_version: None,
-            last_geodb_update: MaybeRfc2822DateTime(None),
-            os_version_id: None,
-            os_pretty_name: None,
-            os_id: None,
-        };
-
-        // Backend type behavior when dealing with repos from http://servername/info/v1/repositories.json
-        // AutoDetect: Try to fetch the repositories.json, if it fails, assume we're on S3 and
-        //             scrape the repositories provided. Accept fetch failures, and accept an empty list.
-        // S3: Scrape the repositories provided. Raise an error if the list is empty.
-        // CMVFS: Fetch the repositories.json and merge it with the repositories provided. Raise an error
-        //        if the fetch fails.
-
-        match self.backend_type {
-            ServerBackendType::AutoDetect => match self.fetch_repos_json(&client).await {
-                Ok(repo_json) => {
-                    debug!("Detected CVMFS backend for {}", self.hostname);
-                    match self.validate_repo_json_and_server_type(&repo_json) {
-                        Ok(_) => {}
-                        Err(error) => return ScrapedServer::Failed(self.to_failed_server(error)),
-                    }
-                    metadata = match MetadataFromRepoJSON::try_from(repo_json.clone()) {
-                        Ok(meta) => meta,
-                        Err(error) => {
-                            return ScrapedServer::Failed(self.to_failed_server(error.into()))
-                        }
-                    };
-                    backend_detected = ServerBackendType::CVMFS;
-
-                    if !only_scrape_forced_repos {
-                        all_repos.extend(
-                            repo_json
-                                .repositories_and_replicas()
-                                .into_iter()
-                                .filter(|r| !ignore.contains(&r.name))
-                                .map(|r| r.name),
-                        );
-                    };
-                }
-                Err(error) => match error {
-                    ScrapeError::FetchError(_) => {
-                        debug!("Detected S3 backend for {}", self.hostname);
-                        backend_detected = ServerBackendType::S3;
-                    }
-                    _ => return ScrapedServer::Failed(self.to_failed_server(error.into())),
-                },
-            },
-            ServerBackendType::S3 => {
-                if all_repos.is_empty() {
-                    error!(
-                        "Empty repository list with explicit S3 backend: {}",
-                        self.hostname
-                    );
-                    return ScrapedServer::Failed(self.to_failed_server(
-                        ScrapeError::EmptyRepositoryList(self.hostname.to_string()).into(),
-                    ));
-                }
-            }
-            ServerBackendType::CVMFS => {
-                let repo_json = match self.fetch_repos_json(&client).await {
-                    Ok(repo_json) => repo_json,
-                    Err(error) => {
-                        return ScrapedServer::Failed(self.to_failed_server(error.into()))
-                    }
-                };
-                metadata = match MetadataFromRepoJSON::try_from(repo_json.clone()) {
-                    Ok(meta) => meta,
-                    Err(error) => {
-                        return ScrapedServer::Failed(self.to_failed_server(error.into()))
-                    }
-                };
-                match self.validate_repo_json_and_server_type(&repo_json) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        return ScrapedServer::Failed(self.to_failed_server(error));
-                    }
-                }
-                if !only_scrape_forced_repos {
-                    all_repos.extend(
-                        repo_json
-                            .repositories_and_replicas()
-                            .into_iter()
-                            .filter(|r| !ignore.contains(&r.name))
-                            .map(|r| r.name),
-                    )
-                };
-            }
-        }
-
-        for repo in all_repos {
-            let repo = RepositoryOrReplica::new(&repo, self);
-            let populated_repo = match repo.scrape(&client).await {
-                Ok(repo) => repo,
-                Err(error) => {
-                    return ScrapedServer::Failed(self.to_failed_server(error));
-                }
-            };
-            populated_repos.push(populated_repo);
-        }
-
-        let meta_json: Option<MetaJSON> = self.fetch_meta_json(&client).await.ok();
-
-        let metadata = self.merge_metadata(metadata, meta_json);
-        let geoapi = if !populated_repos.is_empty() && self.server_type != ServerType::Stratum0 {
-            match self
-                .fetch_geoapi(
-                    &client,
-                    &populated_repos[0].name,
-                    &backend_detected,
-                    geoapi_servers,
-                )
-                .await
-            {
-                Ok(geoapi) => geoapi,
-                Err(error) => {
-                    return ScrapedServer::Failed(self.to_failed_server(error.into()));
-                }
-            }
-        } else {
-            GeoapiServerQuery {
-                hostname: self.hostname.clone(),
-                geoapi_hosts: geoapi_servers,
-                response: Vec::new(),
-            }
-        };
-
-        ScrapedServer::Populated(Box::new(PopulatedServer {
-            server_type: self.server_type,
-            backend_type: self.backend_type,
-            backend_detected,
-            hostname: self.hostname.clone(),
-            repositories: populated_repos,
-            metadata,
-            geoapi,
-        }))
-    }
-
-    async fn fetch_repos_json(
-        &self,
-        client: &reqwest::Client,
-    ) -> Result<RepositoriesJSON, ScrapeError> {
-        fetch_json(
-            client,
-            format!("http://{}/cvmfs/info/v1/repositories.json", self.hostname),
-        )
-        .await
-    }
-
-    async fn fetch_meta_json(&self, client: &reqwest::Client) -> Result<MetaJSON, ScrapeError> {
-        fetch_json(
-            client,
-            format!("http://{}/cvmfs/info/v1/meta.json", self.hostname),
-        )
-        .await
-    }
-
-    async fn fetch_geoapi(
-        &self,
-        client: &reqwest::Client,
-        repository_name: &String,
-        backend_type: &ServerBackendType,
-        geoapi_hosts: Vec<Hostname>,
-    ) -> Result<GeoapiServerQuery, ScrapeError> {
-        // S3 servers do not have GeoAPI support. S3 _is_ the GeoAPI.
-        if *backend_type == ServerBackendType::S3 {
-            debug!("Skipping GeoAPI for S3 server {}", self.hostname);
-            return Ok(GeoapiServerQuery {
-                hostname: self.hostname.clone(),
-                geoapi_hosts,
-                response: Vec::new(),
-            });
-        }
-
-        let random_string = generate_random_string(12);
-        trace!(
-            "Fetching geoapi for {} (using {} as the random string)",
-            self.hostname,
-            random_string
-        );
-        let url = format!(
-            "http://{}/cvmfs/{}/api/v1.0/geo/{}/{}",
-            self.hostname,
-            repository_name,
-            random_string,
-            geoapi_hosts
-                .iter()
-                .map(|hostname| hostname.to_str())
-                .collect::<Vec<&str>>()
-                .join(",")
-        );
-        let response = match fetch_text(client, &url).await {
-            Ok(response) => {
-                debug!("Fetched geoapi: {} -> {}", url, response);
-                response
-                    .trim()
-                    .split(',')
-                    .map(|x| {
-                        x.parse::<u32>()
-                            .map_err(|e| ScrapeError::GeoAPIFailure(e.to_string()))
-                    })
-                    .collect::<Result<Vec<u32>, ScrapeError>>()?
-            }
-            Err(_) => {
-                let error_string = format!(
-                    "Failed to fetch geoapi for {} on {:?} (with {})",
-                    self.hostname, self.backend_type, random_string
-                );
-                warn!("{}", error_string);
-                return Err(ScrapeError::GeoAPIFailure(error_string));
-            }
-        };
-
-        Ok(GeoapiServerQuery {
-            hostname: self.hostname.clone(),
-            geoapi_hosts,
-            response,
-        })
-    }
-
-    fn validate_repo_json_and_server_type(
-        &self,
-        repo_json: &RepositoriesJSON,
-    ) -> Result<(), CVMFSScraperError> {
-        trace!("Validating {}", self.hostname);
-        match (self.server_type, repo_json.replicas.is_empty()) {
-            (ServerType::Stratum0, false) => Err(CVMFSScraperError::ScrapeError(
-                ScrapeError::ServerTypeMismatch(format!(
-                    "{} is a Stratum0 server, but replicas were found in the repositories.json",
-                    self.hostname
-                )),
-            )),
-            (ServerType::Stratum1, true) => Err(CVMFSScraperError::ScrapeError(
-                ScrapeError::ServerTypeMismatch(format!(
-                    "{} is a Stratum1 server, but no replicas were found in the repositories.json",
-                    self.hostname
-                )),
-            )),
-            (ServerType::SyncServer, true) => Err(CVMFSScraperError::ScrapeError(
-                ScrapeError::ServerTypeMismatch(format!(
-                    "{} is a SyncServer, but no replicas were found in the repositories.json",
-                    self.hostname
-                )),
-            )),
-            _ => Ok(()),
-        }
-    }
-
-    fn merge_metadata(
-        &self,
-        repo_meta: MetadataFromRepoJSON,
-        meta_json: Option<MetaJSON>,
-    ) -> ServerMetadata {
-        let mut server_metadata = if let Some(meta) = meta_json {
-            ServerMetadata::from(meta)
-        } else {
-            ServerMetadata {
-                schema_version: None,
-                cvmfs_version: None,
-                last_geodb_update: MaybeRfc2822DateTime(None),
-                os_version_id: None,
-                os_pretty_name: None,
-                os_id: None,
-                administrator: None,
-                email: None,
-                organisation: None,
-                custom: None,
-            }
-        };
-
-        server_metadata.merge_repo_metadata(repo_meta);
-        server_metadata
+    pub fn error(&self) -> &CVMFSScraperError {
+        &self.error
     }
 }
 
-impl std::fmt::Display for PopulatedServer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} ({:?}, {:?})",
-            self.hostname, self.server_type, self.backend_type
-        )
-    }
-}
-
-impl PopulatedServer {
-    pub fn output(&self) {
-        println!("Server: {}", self.hostname);
-        println!("Type: {:?}", self.server_type);
-        println!("Backend: {:?}", self.backend_type);
-        if self.backend_type == ServerBackendType::AutoDetect {
-            println!("Detected Backend: {:?}", self.backend_detected);
-        }
-        if self.backend_detected != ServerBackendType::S3 {
-            self.metadata.output();
-        } else {
-            println!("Metadata: Not vailable for S3 servers.");
-        }
-        if self.backend_detected != ServerBackendType::S3 {
-            println!("GeoAPI:");
-            self.geoapi.output();
-        } else {
-            println!("GeoAPI: Not available for S3 servers.");
-        }
-
-        println!("Repositories:");
-        for repo in &self.repositories {
-            println!("\n Name: {}", repo.name);
-            repo.output();
-        }
-    }
-
-    pub fn has_repository(&self, repository: &str) -> bool {
-        self.repositories.iter().any(|r| r.name == *repository)
-    }
-}
-
-/// Metadata about the server from the repositories.json file.
+/// Server metadata from `cvmfs/info/v1/repositories.json`.
 ///
-/// Note that all the fields are optional. They are not set if the backend is S3, and a CVMFS server
-/// may opt not to provide some of the fields for privacy reasons.
-///
-/// - schema_version: The schema version, typically 1
-/// - cvmfs_version: The version of CVMFS running on the server
-/// - last_geodb_update: The last time the GeoDB was updated
-/// - os_version_id: The version of the operating system
-/// - os_pretty_name: The pretty name of the operating system
-/// - os_id: The ID of the operating system (e.g. rhel)
-#[derive(Debug, Clone, PartialEq)]
-pub struct MetadataFromRepoJSON {
-    pub schema_version: Option<u32>,
-    pub cvmfs_version: Option<semver::Version>,
-    pub last_geodb_update: MaybeRfc2822DateTime,
-    pub os_version_id: Option<String>,
-    pub os_pretty_name: Option<String>,
-    pub os_id: Option<String>,
-}
-
-impl TryFrom<RepositoriesJSON> for MetadataFromRepoJSON {
-    type Error = ScrapeError;
-
-    fn try_from(repo_json: RepositoriesJSON) -> Result<Self, Self::Error> {
-        let cvmfs_version = repo_json
-            .cvmfs_version
-            .clone()
-            .map(|v| {
-                v.parse::<semver::Version>()
-                    .map_err(|e| ScrapeError::ConversionError(e.to_string()))
-            })
-            .transpose()?;
-
-        Ok(MetadataFromRepoJSON {
-            schema_version: Some(repo_json.schema),
-            cvmfs_version,
-            last_geodb_update: repo_json.last_geodb_update.clone(),
-            os_version_id: repo_json.os_version_id.clone(),
-            os_pretty_name: repo_json.os_pretty_name.clone(),
-            os_id: repo_json.os_id.clone(),
-        })
-    }
-}
-
-// Custom serializer function as semver::Version does not implement Serialize
-fn serialize_version_as_string<S>(
-    version: &Option<semver::Version>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
-where
-    S: serde::ser::Serializer,
-{
-    match version {
-        Some(v) => serializer.serialize_some(&v.to_string()),
-        None => serializer.serialize_none(),
-    }
-}
-
-/// Merged metadata about the server from the repositories.json and meta.json files.
-///
-/// This struct contains metadata about the server. It is a combination of the metadata from the
-/// repositories.json file and the meta.json file.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// Fields are optional because an S3 backend has no index and CVMFS servers may
+/// omit version or OS details, including for privacy reasons. The schema is present
+/// for a successfully validated CVMFS index. Contact information from `meta.json`
+/// is kept separately in [`ServerReport::contact`].
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
 pub struct ServerMetadata {
-    pub schema_version: Option<u32>,
-    #[serde(serialize_with = "serialize_version_as_string")]
-    pub cvmfs_version: Option<semver::Version>,
-    pub last_geodb_update: MaybeRfc2822DateTime,
-    pub os_version_id: Option<String>,
-    pub os_pretty_name: Option<String>,
-    pub os_id: Option<String>,
-    pub administrator: Option<String>,
-    pub email: Option<String>,
-    pub organisation: Option<String>,
-    pub custom: Option<serde_json::Value>,
+    schema_version: Option<u32>,
+    cvmfs_version: Option<semver::Version>,
+    last_geodb_update: Option<ReportedTimestamp>,
+    os_version_id: Option<String>,
+    os_pretty_name: Option<String>,
+    os_id: Option<String>,
 }
-
-impl From<MetaJSON> for ServerMetadata {
-    fn from(meta: MetaJSON) -> Self {
-        ServerMetadata {
-            schema_version: None,
-            cvmfs_version: None,
-            last_geodb_update: MaybeRfc2822DateTime(None),
-            os_version_id: None,
-            os_pretty_name: None,
-            os_id: None,
-            administrator: Some(meta.administrator),
-            email: Some(meta.email),
-            organisation: Some(meta.organisation),
-            custom: Some(meta.custom),
-        }
-    }
-}
-
 impl ServerMetadata {
-    pub fn merge_repo_metadata(&mut self, repo_meta: MetadataFromRepoJSON) {
-        self.schema_version = repo_meta.schema_version;
-        self.cvmfs_version = repo_meta.cvmfs_version;
-        self.last_geodb_update = repo_meta.last_geodb_update;
-        self.os_version_id = repo_meta.os_version_id;
-        self.os_pretty_name = repo_meta.os_pretty_name;
-        self.os_id = repo_meta.os_id;
+    /// Schema of the validated index, currently 1; absent without an index.
+    pub fn schema_version(&self) -> Option<u32> {
+        self.schema_version
     }
-
+    /// CVMFS server version reported by the index.
+    pub fn cvmfs_version(&self) -> Option<&semver::Version> {
+        self.cvmfs_version.as_ref()
+    }
+    /// Reported GeoIP database update time; raw text remains available if unparseable.
+    pub fn last_geodb_update(&self) -> Option<&ReportedTimestamp> {
+        self.last_geodb_update.as_ref()
+    }
+    /// Reported operating-system version, such as `9.4`.
+    pub fn os_version_id(&self) -> Option<&str> {
+        self.os_version_id.as_deref()
+    }
+    /// Human-readable operating-system name.
+    pub fn os_pretty_name(&self) -> Option<&str> {
+        self.os_pretty_name.as_deref()
+    }
+    /// Operating-system identifier, such as `rhel`.
+    pub fn os_id(&self) -> Option<&str> {
+        self.os_id.as_deref()
+    }
     pub fn output(&self) {
-        println!("Metadata:");
-        if let Some(schema_version) = self.schema_version {
-            println!("  Schema Version: {}", schema_version);
-        }
-        if let Some(cvmfs_version) = &self.cvmfs_version {
-            println!("  CVMFS Version: {}", cvmfs_version);
-        }
-        if let MaybeRfc2822DateTime(Some(last_geodb_update)) = &self.last_geodb_update {
-            println!("  Last GeoDB Update: {}", last_geodb_update);
-        }
-        if let Some(os_version_id) = &self.os_version_id {
-            println!("  OS Version ID: {}", os_version_id);
-        }
-        if let Some(os_pretty_name) = &self.os_pretty_name {
-            println!("  OS Pretty Name: {}", os_pretty_name);
-        }
-        if let Some(os_id) = &self.os_id {
-            println!("  OS ID: {}", os_id);
-        }
-        if let Some(administrator) = &self.administrator {
-            println!("  Administrator: {}", administrator);
-        }
-        if let Some(email) = &self.email {
-            println!("  Email: {}", email);
-        }
-        if let Some(organisation) = &self.organisation {
-            println!("  Organisation: {}", organisation);
-        }
-        if let Some(custom) = &self.custom {
-            println!("  Custom: {}", custom);
-        }
+        println!("{self:#?}");
     }
 }
 
-pub struct RepositoryOrReplica {
-    pub server: Server,
-    pub name: String,
-}
-
-impl RepositoryOrReplica {
-    pub fn new(name: &str, server: &Server) -> Self {
-        RepositoryOrReplica {
-            server: server.clone(),
-            name: name.to_string(),
-        }
-    }
-
-    pub async fn scrape(
-        &self,
-        client: &reqwest::Client,
-    ) -> Result<PopulatedRepositoryOrReplica, CVMFSScraperError> {
-        let repo_status = self.fetch_repository_status_json(client).await?;
-        Ok(PopulatedRepositoryOrReplica {
-            name: self.name.clone(),
-            manifest: self.fetch_repository_manifest(client).await?,
-            last_snapshot: repo_status.last_snapshot,
-            last_gc: repo_status.last_gc,
-        })
-    }
-
-    async fn fetch_repository_manifest(
-        &self,
-        client: &reqwest::Client,
-    ) -> Result<Manifest, ManifestError> {
-        let url = format!(
-            "http://{}/cvmfs/{}/.cvmfspublished",
-            self.server.hostname, self.name
-        );
-        let response = client.get(url).send().await?;
-        response.error_for_status()?.text().await?.parse()
-    }
-
-    async fn fetch_repository_status_json(
-        &self,
-        client: &reqwest::Client,
-    ) -> Result<StatusJSON, ScrapeError> {
-        fetch_json(
-            client,
-            format!(
-                "http://{}/cvmfs/{}/.cvmfs_status.json",
-                self.server.hostname, self.name
-            ),
-        )
-        .await
-    }
-}
-
-/// A populated repository or replica object.
+/// Bound repository result; only a completed scrape can construct this value.
 ///
-/// This object represents a CVMFS repository or replica that has been scraped for information about
-/// the repository. For fetching the revision of the repository, one can use the `revision` method
-/// as a shortcut to get the revision from the manifest.
-///
-/// Fields:
-///
-/// - name: The name of the repository
-/// - manifest: The manifest of the repository
-/// - last_snapshot: The last time a snapshot was taken (optional)
-/// - last_gc: The last time garbage collection was run (optional)
-///
-/// The MaybeRfc2822DateTime type is used to represent a date and time that may or may not be present,
-/// and may or may not be in the RFC 2822 format. See the documentation for the MaybeRfc2822DateTime
-/// type for more information.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+/// Combines `.cvmfspublished` with optional snapshot and garbage-collection times
+/// from `.cvmfs_status.json`. Repositories and replicas use the same representation.
+/// [`Self::revision`] is a shortcut to the manifest's revision. Timestamp absence
+/// is distinct from a present but unparseable [`ReportedTimestamp`].
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct PopulatedRepositoryOrReplica {
-    pub name: String,
-    pub manifest: Manifest,
-    pub last_snapshot: Option<MaybeRfc2822DateTime>,
-    pub last_gc: Option<MaybeRfc2822DateTime>,
+    manifest: RepositoryManifest,
+    last_snapshot: Option<ReportedTimestamp>,
+    last_gc: Option<ReportedTimestamp>,
 }
-
 impl PopulatedRepositoryOrReplica {
+    /// Validated repository name used for the request and manifest binding.
+    pub fn name(&self) -> &RepositoryName {
+        self.manifest.repository_name()
+    }
+    /// Parsed manifest bound to the requested repository, without signature verification.
+    pub fn manifest(&self) -> &RepositoryManifest {
+        &self.manifest
+    }
+    /// Last snapshot time reported by the status file, if supplied.
+    pub fn last_snapshot(&self) -> Option<&ReportedTimestamp> {
+        self.last_snapshot.as_ref()
+    }
+    /// Last garbage-collection time reported by the status file, if supplied.
+    pub fn last_gc(&self) -> Option<&ReportedTimestamp> {
+        self.last_gc.as_ref()
+    }
+    /// Revision number from the bound manifest.
+    pub fn revision(&self) -> Revision {
+        self.manifest.manifest().revision()
+    }
     pub fn output(&self) {
-        if let Some(last_snapshot) = &self.last_snapshot {
-            println!("  Last Snapshot: {}", last_snapshot);
-        }
-        if let Some(last_gc) = &self.last_gc {
-            println!("  Last GC: {}", last_gc);
-        }
-        self.manifest.output();
-    }
-    pub fn revision(&self) -> i32 {
-        self.manifest.s
-    }
-}
-#[cfg(test)]
-mod test {
-    use super::*;
-    use serde_json::{json, Value};
-    use yare::parameterized;
-
-    fn test_hostname() -> Hostname {
-        Hostname::try_from("example.com").unwrap()
-    }
-
-    fn test_geoapi() -> GeoapiServerQuery {
-        GeoapiServerQuery {
-            hostname: test_hostname(),
-            geoapi_hosts: Vec::new(),
-            response: Vec::new(),
-        }
-    }
-
-    fn test_metadata() -> ServerMetadata {
-        ServerMetadata {
-            schema_version: None,
-            cvmfs_version: None,
-            last_geodb_update: MaybeRfc2822DateTime(None),
-            os_version_id: None,
-            os_pretty_name: None,
-            os_id: None,
-            administrator: None,
-            email: None,
-            organisation: None,
-            custom: None,
-        }
-    }
-
-    fn test_populated_server() -> PopulatedServer {
-        PopulatedServer {
-            server_type: ServerType::Stratum1,
-            backend_type: ServerBackendType::CVMFS,
-            backend_detected: ServerBackendType::CVMFS,
-            hostname: test_hostname(),
-            repositories: Vec::new(),
-            metadata: test_metadata(),
-            geoapi: test_geoapi(),
-        }
-    }
-
-    fn test_failed_server() -> FailedServer {
-        FailedServer {
-            hostname: test_hostname(),
-            server_type: ServerType::Stratum1,
-            backend_type: ServerBackendType::CVMFS,
-            error: CVMFSScraperError::GenericError(GenericError::TypeError("boom".to_string())),
-        }
-    }
-
-    #[test]
-    fn scraped_server_populated_accessors() {
-        let server = ScrapedServer::Populated(Box::new(test_populated_server()));
-
-        assert!(server.is_populated());
-        assert!(server.is_ok());
-        assert!(!server.is_failed());
-        assert_eq!(
-            server.as_populated_server().unwrap().hostname.to_str(),
-            "example.com"
-        );
-        assert!(server.as_failed_server().is_none());
-    }
-
-    #[test]
-    fn scraped_server_failed_accessors() {
-        let server = ScrapedServer::Failed(test_failed_server());
-
-        assert!(server.is_failed());
-        assert!(!server.is_populated());
-        assert!(!server.is_ok());
-        assert_eq!(
-            server.as_failed_server().unwrap().hostname.to_str(),
-            "example.com"
-        );
-        assert!(server.as_populated_server().is_none());
-    }
-
-    #[test]
-    fn scraped_server_into_populated_server_unboxes_value() {
-        let server = ScrapedServer::Populated(Box::new(test_populated_server()));
-
-        let populated = server.into_populated_server().unwrap();
-
-        assert_eq!(populated.hostname.to_str(), "example.com");
-    }
-
-    #[test]
-    fn scraped_server_into_failed_server_returns_value() {
-        let server = ScrapedServer::Failed(test_failed_server());
-
-        let failed = server.into_failed_server().unwrap();
-
-        assert_eq!(failed.hostname.to_str(), "example.com");
-    }
-
-    #[test]
-    fn scraped_server_into_accessors_reject_wrong_variant() {
-        let populated_error = ScrapedServer::Failed(test_failed_server())
-            .into_populated_server()
-            .unwrap_err();
-        let failed_error = ScrapedServer::Populated(Box::new(test_populated_server()))
-            .into_failed_server()
-            .unwrap_err();
-
-        assert_eq!(
-            populated_error.to_string(),
-            "Type error: example.com is a failed server"
-        );
-        assert_eq!(
-            failed_error.to_string(),
-            "Type error: example.com is a populated server"
-        );
-    }
-
-    #[parameterized(
-        test_full_data = {
-            Some(1),
-            Some("2.8.4"),
-            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
-            Some("rhel7"),
-            Some("Red Hat Enterprise Linux 7"),
-            Some("rhel"),
-            Some("admin"),
-            Some("admin@host.com"),
-            Some("host.com"),
-            None // custom field
-        },
-        test_minimal_data = {
-            None, None, None, None, None, None, None, None, None, None
-        },
-        test_custom_data = {
-            None, None, None, None, None, None, None, None, None, Some(json!({"key": "value"}))
-        }
-    )]
-    fn test_serialization_of_metadata(
-        schema_version: Option<u32>,
-        cvmfs_version: Option<&str>,
-        last_geodb_update: Option<&str>,
-        os_version_id: Option<&str>,
-        os_pretty_name: Option<&str>,
-        os_id: Option<&str>,
-        administrator: Option<&str>,
-        email: Option<&str>,
-        organisation: Option<&str>,
-        custom: Option<Value>,
-    ) {
-        // Construct the ServerMetadata instance
-        let metadata = ServerMetadata {
-            schema_version,
-            cvmfs_version: cvmfs_version.map(|v| semver::Version::parse(v).unwrap()),
-            last_geodb_update: MaybeRfc2822DateTime(last_geodb_update.map(|s| s.to_string())),
-            os_version_id: os_version_id.map(|s| s.to_string()),
-            os_pretty_name: os_pretty_name.map(|s| s.to_string()),
-            os_id: os_id.map(|s| s.to_string()),
-            administrator: administrator.map(|s| s.to_string()),
-            email: email.map(|s| s.to_string()),
-            organisation: organisation.map(|s| s.to_string()),
-            custom: custom.clone(),
-        };
-
-        let expected_custom = match &custom {
-            Some(value) => value.clone(),
-            None => Value::Null,
-        };
-
-        // Build the expected JSON
-        let expected = json!({
-            "schema_version": schema_version,
-            "cvmfs_version": cvmfs_version,
-            "last_geodb_update": last_geodb_update,
-            "os_version_id": os_version_id,
-            "os_pretty_name": os_pretty_name,
-            "os_id": os_id,
-            "administrator": administrator,
-            "email": email,
-            "organisation": organisation,
-            "custom": expected_custom,
-        });
-
-        // Serialize the metadata to JSON
-        let json = serde_json::to_value(&metadata).unwrap();
-
-        // Compare the actual JSON with the expected JSON
-        assert_eq!(json, expected);
+        println!("{self:#?}");
     }
 }

@@ -1,67 +1,88 @@
 use std::sync::Arc;
 use thiserror::Error;
 
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
-    #[error("Failed to fetch manifest: {0}")]
-    FetchError(Arc<reqwest::Error>),
-
-    #[error("Missing field {0}")]
+    #[error("Missing manifest field {0}")]
     MissingField(char),
-
-    #[error("Parse error for field {0}: {1}")]
+    #[error("Invalid manifest field {0}: {1}")]
     ParseError(char, String),
-
+    #[error("Invalid manifest line {line}: {reason}")]
+    InvalidLine { line: usize, reason: String },
+    #[error("Duplicate manifest field {0}")]
+    DuplicateField(char),
     #[error("Invalid hex string: {0}")]
     InvalidHex(String),
-
-    #[error("Invalid certificate: {0}")]
-    InvalidCertificate(String),
+    #[error("Invalid digest: {0}")]
+    InvalidDigest(String),
+    #[error("Manifest exceeds {0} bytes")]
+    TooLarge(usize),
+    #[error("Repository identity mismatch: requested {expected}, manifest names {actual}")]
+    RepositoryMismatch { expected: String, actual: String },
 }
 
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum HostnameError {
-    #[error("Invalid hostname length: {0} > 255")]
-    TooLong(String),
+    #[error("Hostname is {0} bytes; expected 1..=253 ASCII bytes")]
+    InvalidLength(usize),
+    #[error("Invalid hostname label {0:?}: expected 1..=63 ASCII letters, digits or hyphens, starting and ending with a letter or digit; use punycode for international names")]
+    InvalidLabel(String),
+}
 
-    #[error("Invalid label length: {0} > 63")]
-    LabelTooLong(String),
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("Invalid repository name {value:?}: {reason}")]
+pub struct RepositoryNameError {
+    pub value: String,
+    pub reason: &'static str,
+}
 
-    #[error("Invalid character in label: {0}")]
-    InvalidChar(String),
-
-    #[error("Invalid label format: {0}")]
-    InvalidLabelFormat(String),
-
-    #[error("Label contains consecutive dashes: {0}")]
-    ConsecutiveDashes(String),
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("Invalid {field}: {reason}")]
+pub struct ConfigurationError {
+    pub field: &'static str,
+    pub reason: String,
 }
 
 #[derive(Error, Debug, Clone)]
 pub enum ScrapeError {
-    #[error("Failed to scrape: {0}")]
-    FetchError(Arc<reqwest::Error>),
-
-    #[error("Failed to parse scrape result: {0}")]
-    ParseError(Arc<serde_json::Error>),
-
-    #[error("Failed to parse scrape result: {0}")]
-    InvalidJson(String),
-
-    #[error("Empty repository list with S3 backend: {0}")]
+    #[error("Request failed for {url}: {source}")]
+    Fetch {
+        url: String,
+        #[source]
+        source: Arc<reqwest::Error>,
+    },
+    #[error("HTTP {status} from {url}")]
+    HttpStatus { url: String, status: u16 },
+    #[error("Invalid JSON from {url}: {source}")]
+    Json {
+        url: String,
+        #[source]
+        source: Arc<serde_json::Error>,
+    },
+    #[error("Response from {url} exceeds {limit} bytes")]
+    BodyTooLarge { url: String, limit: usize },
+    #[error("Server scrape deadline exceeded for {0}")]
+    Timeout(String),
+    #[error("Repository count {actual} exceeds configured limit {limit}")]
+    RepositoryLimit { actual: usize, limit: usize },
+    #[error("Empty effective repository list for S3 backend: {0}")]
     EmptyRepositoryList(String),
-
     #[error("Server type mismatch: {0}")]
     ServerTypeMismatch(String),
-
-    #[error("Chrono parsing error: {0}")]
-    ChronoParseError(#[from] chrono::ParseError),
-
+    #[error("Unsupported repository index schema {0}; supported schema is 1")]
+    UnsupportedSchema(u32),
     #[error("Conversion error: {0}")]
     ConversionError(String),
-
     #[error("GeoAPI failure: {0}")]
     GeoAPIFailure(String),
+    #[error(transparent)]
+    Configuration(#[from] ConfigurationError),
+}
+
+impl ScrapeError {
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::HttpStatus { status: 404, .. })
+    }
 }
 
 #[derive(Error, Debug, Clone)]
@@ -70,44 +91,22 @@ pub enum GenericError {
     TypeError(String),
 }
 
-#[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug, Clone)]
 pub enum CVMFSScraperError {
-    #[error("Scrape error: {0}")]
-    ScrapeError(#[from] ScrapeError),
-
-    #[error("Manifest error: {0}")]
-    ManifestError(#[from] ManifestError),
-
-    #[error("Hostname error: {0}")]
-    HostnameError(#[from] HostnameError),
-
-    #[error("Generic error: {0}")]
-    GenericError(#[from] GenericError),
-}
-
-impl From<reqwest::Error> for ManifestError {
-    fn from(error: reqwest::Error) -> Self {
-        ManifestError::FetchError(Arc::new(error))
-    }
-}
-
-impl From<reqwest::Error> for ScrapeError {
-    fn from(error: reqwest::Error) -> Self {
-        ScrapeError::FetchError(Arc::new(error))
-    }
-}
-
-impl From<serde_json::Error> for ScrapeError {
-    fn from(error: serde_json::Error) -> Self {
-        ScrapeError::ParseError(Arc::new(error))
-    }
-}
-
-// For when we try to convert Hostname to Hostname. We get an infallible
-// conversion error, which we can safely ignore.
-impl From<std::convert::Infallible> for HostnameError {
-    fn from(_: std::convert::Infallible) -> Self {
-        unreachable!("Infallible conversions cannot fail")
-    }
+    #[error(transparent)]
+    Scrape(#[from] ScrapeError),
+    #[error("Manifest at {url}: {source}")]
+    Manifest {
+        url: String,
+        #[source]
+        source: ManifestError,
+    },
+    #[error(transparent)]
+    Hostname(#[from] HostnameError),
+    #[error(transparent)]
+    RepositoryName(#[from] RepositoryNameError),
+    #[error(transparent)]
+    Configuration(#[from] ConfigurationError),
+    #[error(transparent)]
+    Generic(#[from] GenericError),
 }

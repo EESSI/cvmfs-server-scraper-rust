@@ -1,281 +1,245 @@
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 
-use crate::errors::{HostnameError, ManifestError, ScrapeError};
+use crate::errors::{HostnameError, ManifestError, RepositoryNameError, ScrapeError};
 
-/// A hostname string.
+/// Canonical lowercase ASCII DNS name. International names must use IDNA punycode.
+/// Syntax validation does not authorize a network destination.
 ///
-/// This type is used to represent a hostname string. It is a wrapper around a `String` and
-/// provides validation for hostnames.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+/// Names must contain 1..=253 bytes. Each dot-separated label contains 1..=63
+/// ASCII letters, digits, or hyphens and starts and ends with a letter or digit.
+/// Parsing, `TryFrom`, and serde all apply these rules and normalize case.
+/// Ports, URL syntax, and trailing dots are rejected; use [`crate::ServerEndpoint`]
+/// when configuring an HTTP(S) origin with a port.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(try_from = "String", into = "String")]
 pub struct Hostname(String);
 
-impl std::str::FromStr for Hostname {
+impl FromStr for Hostname {
     type Err = HostnameError;
-
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.len() > 255 {
-            return Err(HostnameError::TooLong(s.to_string()));
+        if s.is_empty() || s.len() > 253 {
+            return Err(HostnameError::InvalidLength(s.len()));
         }
-
-        let labels: Vec<&str> = s.split('.').collect();
-        for label in &labels {
-            if label.len() > 63 {
-                return Err(HostnameError::LabelTooLong(label.to_string()));
-            }
-            if !label.chars().all(|c| c.is_alphanumeric() || c == '-') {
-                return Err(HostnameError::InvalidChar(label.to_string()));
-            }
-            // This will also catch empty labels
-            if !label.chars().next().unwrap_or_default().is_alphanumeric()
-                || !label.chars().last().unwrap_or_default().is_alphanumeric()
+        for label in s.split('.') {
+            if label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                || !label.as_bytes()[0].is_ascii_alphanumeric()
+                || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
             {
-                return Err(HostnameError::InvalidLabelFormat(format!(
-                    "First and last character of '{}' is not alphanumeric.",
-                    label
-                )));
-            }
-            if label.contains("--") {
-                return Err(HostnameError::ConsecutiveDashes(label.to_string()));
+                return Err(HostnameError::InvalidLabel(label.into()));
             }
         }
-
-        Ok(Hostname(s.to_string()))
+        Ok(Self(s.to_ascii_lowercase()))
     }
 }
 
-impl std::fmt::Display for Hostname {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl TryFrom<&str> for Hostname {
-    type Error = HostnameError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        s.parse()
-    }
-}
-
-impl TryFrom<String> for Hostname {
-    type Error = HostnameError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        s.parse()
-    }
-}
-
-impl Hostname {
-    pub fn to_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A hexadecimal string.
+/// CVMFS repository identifier, never a URL or a path.
 ///
-/// This type is used to represent a hexadecimal string. It is a wrapper around a `String` and
-/// provides validation for hexadecimal strings. A valid hexadecimal string must:
+/// Accepts 1..=255 ASCII bytes consisting of letters, digits, dots, underscores,
+/// and hyphens, with no empty dot-separated components. Case is preserved.
+/// The same checks apply through parsing, `TryFrom`, and serde.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(try_from = "String", into = "String")]
+pub struct RepositoryName(String);
+impl FromStr for RepositoryName {
+    type Err = RepositoryNameError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let reason = if s.is_empty() || s.len() > 255 {
+            Some("expected 1..=255 bytes")
+        } else if !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            Some("only ASCII letters, digits, '.', '_' and '-' are allowed; paths, escapes and queries are forbidden")
+        } else if s.split('.').any(str::is_empty) {
+            Some("dot-separated components must not be empty")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(RepositoryNameError {
+                value: s.into(),
+                reason,
+            });
+        }
+        Ok(Self(s.into()))
+    }
+}
+
+macro_rules! string_accessors {
+    ($ty:ident, $error:ty) => {
+        impl $ty {
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+            pub fn to_str(&self) -> &str {
+                self.as_str()
+            }
+        }
+        impl TryFrom<String> for $ty {
+            type Error = $error;
+            fn try_from(s: String) -> Result<Self, Self::Error> {
+                s.parse()
+            }
+        }
+        impl TryFrom<&str> for $ty {
+            type Error = $error;
+            fn try_from(s: &str) -> Result<Self, Self::Error> {
+                s.parse()
+            }
+        }
+        impl From<$ty> for String {
+            fn from(value: $ty) -> Self {
+                value.0
+            }
+        }
+        impl AsRef<str> for $ty {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+}
+string_accessors!(Hostname, HostnameError);
+string_accessors!(RepositoryName, RepositoryNameError);
+
+/// General even-length hex text. Manifest digests use the stricter ContentHash type.
 ///
-/// - Contain only hexadecimal characters (0-9, a-f).
-/// - Have an even number of characters.
-///
-/// The string is stored in lowercase.
-#[derive(Debug, Serialize, Clone, PartialEq)]
+/// Accepts only ASCII hexadecimal characters (`0`–`9`, `a`–`f`, `A`–`F`) and
+/// stores them in lowercase. The empty string is valid general hex text; it is
+/// not a valid [`crate::ContentHash`] or [`crate::RootPathMd5`].
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(try_from = "String", into = "String")]
 pub struct HexString(String);
-
 impl HexString {
     pub fn new(s: &str) -> Result<Self, ManifestError> {
-        if s.len().is_multiple_of(2) && s.chars().all(|c| c.is_ascii_hexdigit()) {
-            Ok(HexString(s.to_string().to_lowercase()))
+        if s.len().is_multiple_of(2) && s.bytes().all(|c| c.is_ascii_hexdigit()) {
+            Ok(Self(s.to_ascii_lowercase()))
         } else {
-            Err(ManifestError::InvalidHex(s.to_string()))
+            Err(ManifestError::InvalidHex(s.into()))
         }
     }
 }
-
-impl std::str::FromStr for HexString {
+impl FromStr for HexString {
     type Err = ManifestError;
-
-    fn from_str(s: &str) -> Result<Self, ManifestError> {
-        HexString::new(s)
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
     }
 }
+string_accessors!(HexString, ManifestError);
 
-impl std::fmt::Display for HexString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for HexString {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s: &str = Deserialize::deserialize(deserializer)?;
-        HexString::new(s).map_err(serde::de::Error::custom)
-    }
-}
-
-/// A wrapped optional string that may be a RFC 2822 date-time.
+/// A server's timestamp claim. Unrecognized/localized text is retained without
+/// pretending it specifies a UTC instant. Serde always recomputes the state.
 ///
-/// Due to the fact that the date-time fields generated into the CVMFS JSON files
-/// are produced with the `date` command, they may be localized to the system
-/// that generated them. This means that the date-time fields may not parsable
-/// with any degree of sanity.
-///
-/// To offer both the option of a time-parsed field and the raw string, we store
-/// the string itself and provide a method (`try_into_datetime`) to attempt to
-/// parse the string into a `DateTime<Utc>`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
-pub struct MaybeRfc2822DateTime(pub Option<String>);
-
-impl std::fmt::Display for MaybeRfc2822DateTime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+/// CVMFS JSON timestamps are often produced by the server's `date` command, so
+/// their formatting and timezone names can depend on that server's locale.
+/// This wrapper preserves the original text even when it cannot be interpreted.
+/// [`Self::datetime`] accepts recognized RFC 2822 dates and GNU date-style strings
+/// with UTC, GMT, or numeric offsets. Unknown or ambiguous zone names stay unparsed.
+/// [`Self::try_into_datetime`] reports an error when no instant is available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub struct ReportedTimestamp(TimestampState);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimestampState {
+    Parsed { raw: String, instant: DateTime<Utc> },
+    Unparsed { raw: String },
+}
+impl ReportedTimestamp {
+    pub fn new(raw: String) -> Self {
+        let parsed = DateTime::parse_from_rfc2822(&raw).or_else(|_| {
+            // GNU date emits a named zone by default. Only UTC/GMT are
+            // unambiguous here; numeric offsets are accepted as well.
+            let normalized = raw.replace(" UTC ", " +0000 ").replace(" GMT ", " +0000 ");
+            DateTime::parse_from_str(&normalized, "%a %b %d %H:%M:%S %z %Y")
+        });
+        Self(match parsed {
+            Ok(value) => TimestampState::Parsed {
+                raw,
+                instant: value.with_timezone(&Utc),
+            },
+            Err(_) => TimestampState::Unparsed { raw },
+        })
+    }
+    pub fn as_str(&self) -> &str {
         match &self.0 {
-            Some(date_str) => write!(f, "{}", date_str),
-            None => write!(f, ""),
+            TimestampState::Parsed { raw, .. } | TimestampState::Unparsed { raw } => raw,
+        }
+    }
+    pub fn datetime(&self) -> Option<DateTime<Utc>> {
+        match &self.0 {
+            TimestampState::Parsed { instant, .. } => Some(*instant),
+            TimestampState::Unparsed { .. } => None,
+        }
+    }
+    pub fn try_into_datetime(&self) -> Result<DateTime<Utc>, ScrapeError> {
+        self.datetime().ok_or_else(|| ScrapeError::ConversionError(format!(
+            "timestamp {:?} has an unsupported format or unresolved timezone; use UTC or a numeric offset", self.as_str())))
+    }
+}
+impl From<String> for ReportedTimestamp {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+impl From<ReportedTimestamp> for String {
+    fn from(value: ReportedTimestamp) -> Self {
+        match value.0 {
+            TimestampState::Parsed { raw, .. } | TimestampState::Unparsed { raw } => raw,
         }
     }
 }
+impl fmt::Display for ReportedTimestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
+/// Compatibility wrapper; new models use `Option<ReportedTimestamp>` directly.
+///
+/// Retains the old optional-string shape while distinguishing absent data from
+/// a present but unparseable value. [`Self::try_into_datetime`] returns `Ok(None)`
+/// for absence, `Ok(Some(_))` for a recognized instant, and an error for unresolved
+/// text. [`Self::as_ref`] always permits access to the original text when present.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(transparent)]
+pub struct MaybeRfc2822DateTime(Option<ReportedTimestamp>);
 impl MaybeRfc2822DateTime {
-    pub fn try_into_datetime(&self) -> Result<Option<DateTime<Utc>>, ScrapeError> {
-        match &self.0 {
-            Some(date_str) => {
-                // Try parsing the date string with the format
-                let naive_dt = NaiveDateTime::parse_from_str(date_str, "%a %b %d %H:%M:%S %Z %Y")
-                    .map_err(|_| ScrapeError::ConversionError(date_str.clone()))?;
-                // Convert NaiveDateTime to DateTime<Utc>
-                Ok(Some(DateTime::<Utc>::from_naive_utc_and_offset(
-                    naive_dt, Utc,
-                )))
-            }
-            None => Ok(None),
-        }
+    pub fn new(value: Option<String>) -> Self {
+        Self(value.map(ReportedTimestamp::new))
     }
-
+    pub fn as_ref(&self) -> Option<&ReportedTimestamp> {
+        self.0.as_ref()
+    }
+    pub fn try_into_datetime(&self) -> Result<Option<DateTime<Utc>>, ScrapeError> {
+        self.0
+            .as_ref()
+            .map(ReportedTimestamp::try_into_datetime)
+            .transpose()
+    }
     pub fn is_some(&self) -> bool {
         self.0.is_some()
     }
-
     pub fn is_none(&self) -> bool {
         self.0.is_none()
     }
 }
-
-pub struct Rfc2822DateTime(String);
-
-impl From<&str> for Rfc2822DateTime {
-    fn from(s: &str) -> Self {
-        Rfc2822DateTime(s.to_string())
-    }
-}
-
-impl TryFrom<Rfc2822DateTime> for DateTime<Utc> {
-    type Error = ScrapeError;
-
-    fn try_from(value: Rfc2822DateTime) -> Result<Self, Self::Error> {
-        Ok(DateTime::parse_from_rfc2822(&value.0)?.with_timezone(&Utc))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use yare::parameterized;
-
-    #[parameterized(
-        example_com = { "example.com" },
-        foo_dash_example_com = { "foo-example.com" },
-        numeric_example_com = { "123-example.com" },
-    )]
-    fn test_valid_hostname(hostname_str: &str) {
-        let hostname: Hostname = hostname_str.parse().unwrap();
-        assert_eq!(hostname.to_string(), hostname_str);
-    }
-
-    #[parameterized(
-        empty_str = { "" },
-        too_long_str = { &"a".repeat(256) },
-        invalid_char_str = { "example.com!" },
-        invalid_label_format_str = { "-example.com" },
-        consecutive_dashes_str = { "foo--example.com" },
-        double_dot = { "example..com" },
-        ends_with_dash_str = { "example-.com" },
-        ends_with_dot = { "example.com." },
-        label_ends_with_dash = { "example-.com" },
-        label_ends_with_underscore = { "example_.com" },
-        label_starts_with_underscore = { "_example.com" },
-    )]
-    fn test_invalid_hostname(hostname_str: &str) {
-        assert!(hostname_str.parse::<Hostname>().is_err());
-    }
-
-    #[parameterized(
-        deadbeef = { "deadbeef" },
-        abcdef = { "abcdef" },
-        abcdef123456 = { "abcdef123456" },
-        uppercase = { "AAABBB" },
-        empty = { "" },
-    )]
-    fn test_valid_hexstrings(hex_str: &str) {
-        let hexstring = HexString::new(hex_str).unwrap();
-        assert_eq!(hexstring.to_string(), hex_str.to_lowercase());
-    }
-
-    #[parameterized(
-        deadbeefg = { "deadbeefg" },
-        abcdefg = { "abcdefg" },
-        abcdef123456g = { "abcdef123456g" },
-    )]
-
-    fn test_invalid_hexstrings(hex_str: &str) {
-        match HexString::new(hex_str) {
-            Err(ManifestError::InvalidHex(s)) => {
-                assert_eq!(s, hex_str);
-            }
-            _ => panic!("Unexpected success from {:?}", hex_str),
+impl fmt::Display for MaybeRfc2822DateTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(value) = &self.0 {
+            value.fmt(f)
+        } else {
+            Ok(())
         }
-    }
-
-    // Note that we test comparison against UTC time, so the input string must be in UTC
-    #[parameterized(
-        one = { "Fri, 21 Jun 2024 17:40:02 +0000" },
-        two = { "Sun, 16 Jun 2024 00:00:59 +0000" },
-        three = { "Tue, 18 Jun 2024 13:40:04 +0000" },
-    )]
-    fn test_valid_rfc2822datetime(date: &str) {
-        let rfc2822 = Rfc2822DateTime::from(date);
-        let datetime: DateTime<Utc> = rfc2822.try_into().unwrap();
-        assert_eq!(datetime.to_rfc2822(), date);
-    }
-
-    #[parameterized(
-        empty_str = { "" },
-        invalid_char = { "foo" },
-        missing_lots = { "Fri, 21 Jun 2024" },
-        missing_timezone = { "Fri, 21 Jun 2024 17:40:02" },
-    )]
-    fn test_invalid_rfc2822datetime(date: &str) {
-        let rfc2822 = Rfc2822DateTime::from(date);
-        let result: Result<DateTime<Utc>, ScrapeError> = rfc2822.try_into();
-        match result {
-            Err(_) => {}
-            _ => panic!("Unexpected success from {:?}", date),
-        }
-    }
-
-    #[test]
-    fn test_hostname_as_str() {
-        let hostname = Hostname("example.com".to_string());
-        assert_eq!(hostname.to_str(), "example.com");
-    }
-
-    #[test]
-    fn test_hostname_as_string() {
-        let hostname = Hostname("example.com".to_string());
-        assert_eq!(hostname.to_string(), "example.com");
     }
 }
