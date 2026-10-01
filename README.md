@@ -216,6 +216,10 @@ Add the `online-tests` label to a PR to enable the separate online CI workflow, 
 
 Parameterized tests use `rstest` with named `#[case::name(...)]` cases. See [testing and coverage](docs/testing.md) for coverage commands, the measured baseline, remaining gaps, and CI reports.
 
+## Releasing
+
+Version tags (`v<VERSION>`) publish to crates.io through GitHub Actions trusted publishing. See [the release guide](docs/releasing.md) for one-time maintainer setup, release preparation, and handling existing tags.
+
 ## License
 
 MIT; see [LICENSE.txt](LICENSE.txt).
