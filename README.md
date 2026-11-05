@@ -2,9 +2,9 @@
 
 This Rust library fetches CVMFS repository indexes, manifests, status files, server metadata, and GeoAPI responses. Domain values validate at input boundaries, HTTP work has explicit resource limits, and results distinguish backend assumptions and optional probe failures.
 
-## Version 0.1.0 — 2026-09-29
+## Version 0.1.1 — 2026-11-05
 
-Version 0.1.0 introduces validated configuration and domain types, bounded HTTP requests, and reports that preserve successful repositories alongside individual failures. It requires **Rust 1.88 or newer** and includes breaking API and serialization changes from 0.0.7. See the [release notes](Changelog.md#010---2026-09-29) and [migration guide](#migrating-from-007) before upgrading.
+Version 0.1.1 updates dependencies and resolves six RustSec vulnerability findings in the locked TLS dependencies, including CVE-2026-111943, plus a Tokio I/O safety advisory. It requires **Rust 1.88 or newer** and preserves the 0.1.0 API. See the [release notes](Changelog.md#011---2026-11-05). Users upgrading from 0.0.7 should also follow the [migration guide](#migrating-from-007) for the API and serialization changes introduced in 0.1.0.
 
 Starting with 0.1.0, compatible changes use patch releases; breaking API changes use a new minor version while the crate remains pre-1.0.
 
@@ -14,8 +14,16 @@ Add the library to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-cvmfs_server_scraper = "0.1.0"
+cvmfs_server_scraper = "0.1.1"
 ```
+
+When upgrading an application with an existing lockfile, refresh the TLS dependencies too:
+
+```sh
+cargo update -p cvmfs_server_scraper -p rustls -p rustls-webpki -p webpki-root-certs
+```
+
+The patched minimum versions are `rustls` 0.23.46, `rustls-webpki` 0.103.16, and `webpki-root-certs` 1.0.10. This library's lockfile does not constrain downstream applications; check your application's resolved dependencies with `cargo audit`.
 
 ## Usage
 

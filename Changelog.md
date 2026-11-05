@@ -9,6 +9,20 @@ increment the minor version; compatible changes increment the patch version.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-05
+
+### Security
+
+- Updated locked `rustls` to 0.23.46, resolving [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346.html), [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347.html), [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348.html), and [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349.html).
+- Updated locked `rustls-webpki` to 0.103.16 and `webpki-root-certs` to 1.0.11 to reject distrusted emSign intermediates ([RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html), [RUSTSEC-2026-0383](https://rustsec.org/advisories/RUSTSEC-2026-0383.html); CVE-2026-111943).
+- Raised the Tokio dependency minimum to 1.54.1, resolving the `AsyncFd` I/O safety advisory [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386.html).
+- Consumers with an existing lockfile should also update `rustls`, `rustls-webpki`, and `webpki-root-certs`; a library's lockfile does not constrain downstream resolution. Advisory applicability depends on enabled features and API usage.
+
+### Changed
+
+- Refreshed all Rust dependencies to their latest compatible releases and upgraded the `rstest` development dependency to 0.28.0. Rust 1.88 remains supported.
+- Updated artifact uploads to `actions/upload-artifact` v7.0.2 and crates.io authentication to `rust-lang/crates-io-auth-action` v1.0.6.
+
 ## [0.1.0] - 2026-09-29
 
 ### Fixed

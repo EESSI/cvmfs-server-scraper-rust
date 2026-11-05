@@ -19,10 +19,11 @@ No long-lived crates.io token is required in GitHub secrets.
 Before pushing the first tag that includes this workflow:
 
 1. Have an EESSI administrator add
-   `rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18`
-   (v1.0.5) to the allowed actions in **Settings → Actions → General**. EESSI's
-   current policy blocks this action; the publishing workflow cannot start until
-   it is allowed. Keep this entry aligned when updating the action's pinned commit.
+   `rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9`
+   (v1.0.6) to the allowed actions in **Settings → Actions → General** if the
+   organization's policy restricts allowed actions. The publishing workflow
+   requires this action to be allowed. Keep this entry aligned when updating
+   the action's pinned commit.
 2. In the repository's **Settings → Environments**, create an environment named
    `crates-io`. Configure **Selected branches and tags** to allow tags matching
    `v*`. Add required reviewers if release approval is desired.
